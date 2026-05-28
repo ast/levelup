@@ -1,0 +1,74 @@
+#+title: levelup
+#+author: Albin Stigö
+#+options: toc:nil num:nil
+
+A Rust workspace of personal-computing tools.
+
+* Crates
+
+** hugin
+
+A Wayland clipboard manager for sway and other wlroots-based compositors. Watches the clipboard via =wlr-data-control-unstable-v1= and persists every selection change to SQLite. Both the *regular* selection (Ctrl-C / Ctrl-V) and the *primary* selection (mouse text selection / middle-click) are tracked as independent streams.
+
+Planned: expose history to AI via MCP; synchronize across machines.
+
+** munin
+
+An atuin-like shell history search with an fzf-style TUI. Currently a stub.
+
+* Requirements
+
+- Rust 1.85+ (edition 2024)
+- A wlroots-based Wayland compositor (sway, hyprland, river). =wlr-data-control-unstable-v1= is *not* implemented by GNOME or KDE.
+- =wl-clipboard= for the smoke-test recipe (=wl-copy=, =wl-paste=).
+- =just= (optional, for the workspace recipes — see [[file:justfile][justfile]]).
+
+* Build
+
+#+begin_src sh
+cargo build --workspace --release
+#+end_src
+
+Via =just=:
+
+#+begin_src sh
+just build         # debug
+just release       # release
+just check         # type-check
+just lint          # clippy -D warnings
+just fmt           # rustfmt
+#+end_src
+
+* Running hugin
+
+The daemon =hugind= is a foreground process, intended to be supervised by =systemd --user= eventually; run it directly from a shell during development.
+
+#+begin_src sh
+# Default DB at $XDG_DATA_HOME/hugin/hugin.db
+cargo run --bin hugind -p hugin
+
+# Override the DB location and crank up logging
+HUGIN_LOG=debug ./target/release/hugind --db /tmp/hugin.db
+
+# Inspect what's been captured
+just schema
+#+end_src
+
+Run the end-to-end smoke test (this *overwrites your clipboard*):
+
+#+begin_src sh
+just smoke
+#+end_src
+
+See =hugind --help= for retention flags.
+
+* Project layout
+
+- =hugin/= — clipboard manager daemon (=hugind=)
+- =munin/= — shell history TUI (stub)
+- =justfile= — workspace recipes
+- =CLAUDE.md= — instructions for [[https://claude.com/claude-code][Claude Code]]
+
+* License
+
+MIT. See [[file:LICENSE][LICENSE]].
