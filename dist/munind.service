@@ -1,0 +1,13 @@
+[Unit]
+Description=munin shell-history daemon
+PartOf=default.target
+After=default.target
+
+[Service]
+Type=notify
+ExecStart=%h/.cargo/bin/munind
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
