@@ -16,7 +16,7 @@ use tracing::{info, warn};
 
 use crate::proto::{Request, Response};
 use crate::wayland::{CmdSender, WaylandCmd};
-use crate::{storage, Selection};
+use crate::{Selection, storage};
 
 /// Bind to `socket_path` (cleaning a stale file if no live daemon owns it)
 /// and serve connections until the listener errors. `cmd_tx` is the channel
@@ -165,6 +165,31 @@ async fn dispatch<W: AsyncWriteExt + Unpin>(
                 Ok(Ok(())) => write_response(wr, &Response::Ok).await,
                 Ok(Err(e)) => write_error(wr, e.to_string()).await,
                 Err(_) => write_error(wr, "no reply from wayland thread".into()).await,
+            }
+        }
+        Request::Search {
+            query,
+            raw,
+            sort,
+            limit,
+            selection,
+        } => {
+            let db = db_path.to_owned();
+            let result = tokio::task::spawn_blocking(move || -> Result<_> {
+                let conn = Connection::open(&db)?;
+                storage::search(
+                    &conn,
+                    &query,
+                    raw,
+                    sort,
+                    limit.unwrap_or(50),
+                    selection.as_deref(),
+                )
+            })
+            .await?;
+            match result {
+                Ok(entries) => write_response(wr, &Response::Entries { entries }).await,
+                Err(e) => write_error(wr, e.to_string()).await,
             }
         }
         Request::ReadBlob { id, mime } => {

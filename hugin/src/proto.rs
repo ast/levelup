@@ -4,6 +4,7 @@
 //! `read-blob` request is answered with a `BlobHeader` JSON line followed
 //! by `len` raw bytes on the same stream.
 
+use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -14,8 +15,13 @@ pub struct EntryMeta {
     pub selection: String,
     pub mimes: Vec<String>,
     pub size_bytes: i64,
+    /// Short text excerpt of the entry. For `list` / `get` responses this
+    /// is the leading 200 chars of the indexable text (or `None` for
+    /// image-only entries). For `search` responses it's an FTS5
+    /// `snippet()` excerpt with match terms wrapped in `‹›` and elided
+    /// context shown as `…`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub preview: Option<String>,
+    pub snippet: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,6 +52,27 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         selection: Option<String>,
     },
+    /// Full-text search across indexed entries. `query` is treated as a
+    /// single phrase unless `raw` is true (then it's passed to FTS5 as-is).
+    Search {
+        query: String,
+        #[serde(default)]
+        raw: bool,
+        #[serde(default)]
+        sort: SearchSort,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selection: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum SearchSort {
+    #[default]
+    Relevance,
+    Recent,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

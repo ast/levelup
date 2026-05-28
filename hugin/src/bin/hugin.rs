@@ -10,7 +10,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 
 use hugin::default_socket_path;
-use hugin::proto::{EntryMeta, Request, Response};
+use hugin::proto::{EntryMeta, Request, Response, SearchSort};
 
 #[derive(Parser)]
 #[command(
@@ -54,6 +54,25 @@ enum Cmd {
     #[command(visible_alias = "cp")]
     Copy {
         id: i64,
+        #[arg(long, value_parser = ["regular", "primary"])]
+        selection: Option<String>,
+    },
+    /// Full-text search clipboard history
+    #[command(visible_alias = "s")]
+    Search {
+        /// Query string. Joined with spaces. Treated as a single phrase
+        /// unless --raw is given.
+        #[arg(required = true)]
+        query: Vec<String>,
+        /// Pass the query through to FTS5 verbatim (enables operators like
+        /// AND, OR, NEAR, prefix*, "exact phrase").
+        #[arg(long)]
+        raw: bool,
+        /// Result ordering.
+        #[arg(long, value_enum, default_value_t = SearchSort::Relevance)]
+        sort: SearchSort,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
         #[arg(long, value_parser = ["regular", "primary"])]
         selection: Option<String>,
     },
@@ -134,6 +153,29 @@ fn main() -> Result<()> {
                 other => return Err(unexpected("copy", &other)),
             }
         }
+        Cmd::Search {
+            query,
+            raw,
+            sort,
+            limit,
+            selection,
+        } => {
+            send(
+                &mut writer,
+                &Request::Search {
+                    query: query.join(" "),
+                    raw,
+                    sort,
+                    limit: Some(limit),
+                    selection,
+                },
+            )?;
+            match read_response(&mut reader)? {
+                Response::Entries { entries } => print_table(&entries),
+                Response::Error { message } => return Err(anyhow!("{message}")),
+                other => return Err(unexpected("search", &other)),
+            }
+        }
         Cmd::Completions { .. } => unreachable!("handled before connecting"),
     }
     Ok(())
@@ -167,20 +209,28 @@ fn print_table(entries: &[EntryMeta]) {
     }
     println!(
         "{:<6} {:<19} {:<8} {:<9} {}",
-        "ID", "TIME", "SEL", "SIZE", "PREVIEW"
+        "ID", "TIME", "SEL", "SIZE", "SNIPPET"
     );
     for e in entries {
-        let preview = e.preview.as_deref().unwrap_or("");
-        let preview: String = preview
+        let snippet = e.snippet.as_deref().unwrap_or("");
+        let mut label: String = snippet
             .chars()
             .take(60)
             .collect::<String>()
             .replace('\n', "\u{21B5}")
             .replace('\t', " ");
-        let label = if preview.is_empty() {
+        // Search snippets carry ‹match› markers. If truncation lands inside
+        // a pair we'd render a dangling ‹ — append a closer for each
+        // unclosed opener so the row stays balanced.
+        let opens = label.matches('‹').count();
+        let closes = label.matches('›').count();
+        for _ in 0..opens.saturating_sub(closes) {
+            label.push('›');
+        }
+        let display = if label.is_empty() {
             format!("({} MIMEs)", e.mimes.len())
         } else {
-            preview
+            label
         };
         println!(
             "{:<6} {:<19} {:<8} {:<9} {}",
@@ -188,7 +238,7 @@ fn print_table(entries: &[EntryMeta]) {
             fmt_ts(e.ts_unix_ns),
             e.selection,
             human_size(e.size_bytes),
-            label
+            display
         );
     }
 }
@@ -202,8 +252,8 @@ fn print_info(e: &EntryMeta) {
     for m in &e.mimes {
         println!("  - {m}");
     }
-    if let Some(p) = &e.preview {
-        println!("preview:   {}", p.chars().take(200).collect::<String>());
+    if let Some(s) = &e.snippet {
+        println!("snippet:   {}", s.chars().take(200).collect::<String>());
     }
 }
 

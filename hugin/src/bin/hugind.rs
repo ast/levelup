@@ -8,7 +8,7 @@ use tokio::signal::unix::{signal, SignalKind};
 use tracing::{info, warn};
 
 use hugin::cli::DaemonArgs;
-use hugin::storage::spawn_storage_thread;
+use hugin::storage::{Store, spawn_storage_thread};
 use hugin::wayland::WaylandCmd;
 use hugin::{init_tracing, ipc, wayland, CapturedEntry};
 
@@ -28,8 +28,13 @@ fn main() -> Result<()> {
     let socket_path = args.socket_path();
     let watch_primary = args.primary;
 
+    // Open the store synchronously so a schema-version mismatch aborts the
+    // daemon with a clear error before anything else starts.
+    let store = Store::open(&db_path)?;
+    info!(db = %db_path.display(), "storage opened");
+
     let (capture_tx, capture_rx) = mpsc::channel::<CapturedEntry>();
-    let storage = spawn_storage_thread(db_path.clone(), capture_rx, args.retention())?;
+    let storage = spawn_storage_thread(store, capture_rx, args.retention())?;
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<WaylandCmd>();
 
