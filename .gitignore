@@ -1,0 +1,38 @@
+# Cargo build artifacts (workspace target dir lives at the root)
+/target/
+
+# Stale per-crate locks / targets — superseded by the workspace ones
+/*/target/
+/*/Cargo.lock
+
+# Editor / IDE state (per-user; commit a shared config under .vscode/ explicitly if needed)
+.vscode/
+.idea/
+*.iml
+
+# Editor swap, backup, and history files
+*.swp
+*.swo
+*~
+.#*
+\#*\#
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Local environment overrides (anything secret stays out of the tree)
+.env
+.env.*
+!.env.example
+
+# Profiling / coverage output
+/perf.data
+/perf.data.old
+flamegraph.svg
+tarpaulin-report.html
+lcov.info
+cobertura.xml
+
+# rust-analyzer (cargo projects don't need this file — ignore if generated)
+rust-project.json
