@@ -69,6 +69,8 @@ The =hugin= CLI talks to the running daemon over its unix socket. By default it 
 | =hugin get ID [--mime MIME]=                   | Write the entry's contents to stdout. Default MIME is the first =text/*= advertised, falling back to the first available. |
 | =hugin copy ID [--selection regular\|primary]= | Put an old entry back on the clipboard. The daemon becomes the data source until another app takes over. |
 
+Each subcommand has a short unix-style alias: =ls= (list), =stat= (info), =cat= (get), =cp= (copy), =comp= (completions). =hugin --help= shows them.
+
 Examples:
 
 #+begin_src sh
@@ -103,12 +105,39 @@ just smoke
 just schema   # peek at the live SQLite store
 #+end_src
 
-** Running under systemd
-
-For day-to-day use, run =hugind= as a user service tied to the graphical session. A ready-to-edit unit lives at [[file:dist/hugind.service][=dist/hugind.service=]].
+** Install
 
 #+begin_src sh
-cargo install --path hugin --bin hugind                    # installs to ~/.cargo/bin
+just install           # cargo install --path hugin --locked
+# binaries land in ~/.cargo/bin/{hugind,hugin}
+#+end_src
+
+*** Shell completions
+
+#+begin_src sh
+# zsh
+mkdir -p ~/.config/zsh/completions
+just completions-hugin  zsh > ~/.config/zsh/completions/_hugin
+just completions-hugind zsh > ~/.config/zsh/completions/_hugind
+# add `fpath+=(~/.config/zsh/completions)` to ~/.zshrc before `compinit`
+
+# fish
+just completions-hugin  fish > ~/.config/fish/completions/hugin.fish
+just completions-hugind fish > ~/.config/fish/completions/hugind.fish
+
+# bash
+just completions-hugin  bash > ~/.local/share/bash-completion/completions/hugin
+just completions-hugind bash > ~/.local/share/bash-completion/completions/hugind
+#+end_src
+
+The binaries also know how to produce their own completions: =hugin completions zsh= and =hugind --generate-completions zsh= are equivalent to the just recipes.
+
+** Running under systemd
+
+For day-to-day use, run =hugind= as a user service tied to the graphical session. A ready-to-edit unit lives at [[file:dist/hugind.service][=dist/hugind.service=]] (it expects the binary at =~/.cargo/bin/hugind=, i.e. wherever =just install= puts it).
+
+#+begin_src sh
+just install
 mkdir -p ~/.config/systemd/user
 cp dist/hugind.service ~/.config/systemd/user/
 systemctl --user daemon-reload

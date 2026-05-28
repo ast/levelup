@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use sd_notify::NotifyState;
 use tokio::signal::unix::{signal, SignalKind};
 use tracing::{info, warn};
@@ -14,6 +14,13 @@ use hugin::{init_tracing, ipc, wayland, CapturedEntry};
 
 fn main() -> Result<()> {
     let args = DaemonArgs::parse();
+
+    if let Some(shell) = args.generate_completions {
+        let mut cmd = DaemonArgs::command();
+        clap_complete::generate(shell, &mut cmd, "hugind", &mut std::io::stdout());
+        return Ok(());
+    }
+
     init_tracing();
     info!("hugin daemon starting");
 

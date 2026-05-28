@@ -46,6 +46,18 @@ schema-of DB:
 hugin *ARGS:
     cargo run --quiet --bin hugin -p hugin -- {{ARGS}}
 
+# Install hugind + hugin to ~/.cargo/bin (the path dist/hugind.service expects)
+install:
+    cargo install --path hugin --locked
+
+# Print hugin CLI completions for SHELL (bash, zsh, fish, elvish, powershell)
+completions-hugin SHELL:
+    @cargo run --quiet --bin hugin -p hugin -- completions {{SHELL}}
+
+# Print hugind daemon completions for SHELL
+completions-hugind SHELL:
+    @cargo run --quiet --bin hugind -p hugin -- --generate-completions {{SHELL}}
+
 # End-to-end smoke test against a temp DB + socket (overwrites your clipboard; needs wl-clipboard)
 smoke: build
     #!/usr/bin/env bash

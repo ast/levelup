@@ -6,7 +6,8 @@ use std::path::PathBuf;
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{Local, TimeZone};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::Shell;
 
 use hugin::default_socket_path;
 use hugin::proto::{EntryMeta, Request, Response};
@@ -31,6 +32,7 @@ enum Cmd {
     /// Verify the daemon is responsive
     Ping,
     /// List recent clipboard entries (newest first)
+    #[command(visible_alias = "ls")]
     List {
         #[arg(long, default_value_t = 50)]
         limit: usize,
@@ -38,8 +40,10 @@ enum Cmd {
         selection: Option<String>,
     },
     /// Show metadata for a single entry
+    #[command(visible_alias = "stat")]
     Info { id: i64 },
     /// Write the contents of an entry to stdout
+    #[command(visible_alias = "cat")]
     Get {
         id: i64,
         /// MIME to fetch. Defaults to first `text/*`, else first available.
@@ -47,15 +51,30 @@ enum Cmd {
         mime: Option<String>,
     },
     /// Put an old entry back onto the clipboard
+    #[command(visible_alias = "cp")]
     Copy {
         id: i64,
         #[arg(long, value_parser = ["regular", "primary"])]
         selection: Option<String>,
     },
+    /// Print a shell-completion script for SHELL to stdout
+    #[command(visible_alias = "comp")]
+    Completions {
+        #[arg(value_enum)]
+        shell: Shell,
+    },
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // Completions don't talk to the daemon; handle before any socket connect.
+    if let Cmd::Completions { shell } = cli.cmd {
+        let mut cmd = Cli::command();
+        clap_complete::generate(shell, &mut cmd, "hugin", &mut std::io::stdout());
+        return Ok(());
+    }
+
     let path = cli.socket.unwrap_or_else(default_socket_path);
     let stream = UnixStream::connect(&path)
         .with_context(|| format!("connect to hugin daemon at {}", path.display()))?;
@@ -115,6 +134,7 @@ fn main() -> Result<()> {
                 other => return Err(unexpected("copy", &other)),
             }
         }
+        Cmd::Completions { .. } => unreachable!("handled before connecting"),
     }
     Ok(())
 }

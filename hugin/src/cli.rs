@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Parser;
+use clap_complete::Shell;
 
 use crate::default_socket_path;
 use crate::storage::{default_db_path, RetentionConfig};
@@ -30,6 +31,10 @@ pub struct DaemonArgs {
     /// in many apps emit a steady stream of new MIMEs that crowd the history.
     #[arg(long)]
     pub primary: bool,
+
+    /// Print a shell-completion script for SHELL to stdout and exit.
+    #[arg(long, value_name = "SHELL", value_enum)]
+    pub generate_completions: Option<Shell>,
 }
 
 impl DaemonArgs {
