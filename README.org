@@ -41,30 +41,67 @@ just fmt           # rustfmt
 
 * Running hugin
 
-The daemon =hugind= is a foreground process, intended to be supervised by =systemd --user= eventually; run it directly from a shell during development.
+** Daemon (=hugind=)
+
+A foreground process intended to be supervised by =systemd --user= eventually; run it directly from a shell during development.
 
 #+begin_src sh
-# Default DB at $XDG_DATA_HOME/hugin/hugin.db
+# Default DB at $XDG_DATA_HOME/hugin/hugin.db,
+# socket at $XDG_RUNTIME_DIR/hugin.sock
 cargo run --bin hugind -p hugin
 
-# Override the DB location and crank up logging
-HUGIN_LOG=debug ./target/release/hugind --db /tmp/hugin.db
-
-# Inspect what's been captured
-just schema
+# Override paths and crank up logging
+HUGIN_LOG=debug ./target/release/hugind \
+    --db /tmp/hugin.db --socket /tmp/hugin.sock
 #+end_src
 
-Run the end-to-end smoke test (this *overwrites your clipboard*):
+See =hugind --help= for retention flags (=--max-entries=, =--max-age-days=).
+
+** CLI (=hugin=)
+
+The =hugin= CLI talks to the running daemon over its unix socket. By default it connects to =$XDG_RUNTIME_DIR/hugin.sock=; pass =--socket PATH= to override.
+
+| Subcommand                                     | What it does                                                  |
+|------------------------------------------------+---------------------------------------------------------------|
+| =hugin ping=                                   | Verify the daemon is responsive.                              |
+| =hugin list [--limit N] [--selection regular\|primary]= | Print recent entries, newest first.                  |
+| =hugin info ID=                                | Show metadata for one entry (timestamp, selection, MIMEs).    |
+| =hugin get ID [--mime MIME]=                   | Write the entry's contents to stdout. Default MIME is the first =text/*= advertised, falling back to the first available. |
+
+Examples:
+
+#+begin_src sh
+# What's in the recent history?
+hugin list
+
+# Just things selected with the mouse (primary), last 10
+hugin list --selection primary --limit 10
+
+# Inspect which MIME variants exist for an entry
+hugin info 42
+
+# Get the plain text…
+hugin get 42
+
+# …or the HTML the source app also offered
+hugin get 42 --mime text/html
+
+# Round-trip an old entry back onto the clipboard
+hugin get 42 | wl-copy
+#+end_src
+
+** Smoke test
+
+Drive the whole pipeline (build, launch daemon, =wl-copy=, query via CLI, tear down). *Overwrites your clipboard.*
 
 #+begin_src sh
 just smoke
+just schema   # peek at the live SQLite store
 #+end_src
-
-See =hugind --help= for retention flags.
 
 * Project layout
 
-- =hugin/= — clipboard manager daemon (=hugind=)
+- =hugin/= — clipboard crate; produces =hugind= (daemon) and =hugin= (CLI)
 - =munin/= — shell history TUI (stub)
 - =justfile= — workspace recipes
 - =CLAUDE.md= — instructions for [[https://claude.com/claude-code][Claude Code]]

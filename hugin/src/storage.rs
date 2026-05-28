@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use tracing::{debug, info, warn};
 
+use crate::proto::EntryMeta;
 use crate::{is_text_mime, CapturedEntry};
 
 const SCHEMA_SQL: &str = "
@@ -196,6 +197,127 @@ pub fn run_storage_thread(
     }
     info!("storage thread exiting (channel closed)");
     Ok(())
+}
+
+/// Return up to `limit` most-recent entries (newest first), optionally
+/// filtered to a single selection (`"regular"` or `"primary"`).
+pub fn list(conn: &Connection, limit: usize, selection: Option<&str>) -> Result<Vec<EntryMeta>> {
+    let rows: Vec<(i64, i64, String, i64, Option<String>)> = match selection {
+        Some(s) => {
+            let mut stmt = conn.prepare(
+                "SELECT id, ts_unix_ns, selection, size_bytes, preview
+                 FROM entries WHERE selection = ?1
+                 ORDER BY id DESC LIMIT ?2",
+            )?;
+            stmt.query_map(params![s, limit as i64], row_to_tuple)?
+                .collect::<rusqlite::Result<_>>()?
+        }
+        None => {
+            let mut stmt = conn.prepare(
+                "SELECT id, ts_unix_ns, selection, size_bytes, preview
+                 FROM entries ORDER BY id DESC LIMIT ?1",
+            )?;
+            stmt.query_map(params![limit as i64], row_to_tuple)?
+                .collect::<rusqlite::Result<_>>()?
+        }
+    };
+
+    let mut mime_stmt = conn
+        .prepare("SELECT mime FROM mime_parts WHERE entry_id = ?1 ORDER BY mime")?;
+    rows.into_iter()
+        .map(|(id, ts_unix_ns, selection, size_bytes, preview)| {
+            let mimes = mime_stmt
+                .query_map(params![id], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(EntryMeta {
+                id,
+                ts_unix_ns,
+                selection,
+                mimes,
+                size_bytes,
+                preview,
+            })
+        })
+        .collect()
+}
+
+/// Metadata for a single entry by id, or `None` if not found.
+pub fn get(conn: &Connection, id: i64) -> Result<Option<EntryMeta>> {
+    let row = conn
+        .query_row(
+            "SELECT id, ts_unix_ns, selection, size_bytes, preview
+             FROM entries WHERE id = ?1",
+            params![id],
+            row_to_tuple,
+        )
+        .optional()?;
+    let Some((id, ts_unix_ns, selection, size_bytes, preview)) = row else {
+        return Ok(None);
+    };
+    let mut stmt =
+        conn.prepare("SELECT mime FROM mime_parts WHERE entry_id = ?1 ORDER BY mime")?;
+    let mimes = stmt
+        .query_map(params![id], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(Some(EntryMeta {
+        id,
+        ts_unix_ns,
+        selection,
+        mimes,
+        size_bytes,
+        preview,
+    }))
+}
+
+/// Read the raw blob for `(id, mime)`. If `mime` is `None`, picks the first
+/// `text/*` MIME, falling back to the first available. Returns the actual
+/// MIME alongside the bytes so the caller can report what they got.
+pub fn read_blob(
+    conn: &Connection,
+    id: i64,
+    mime: Option<&str>,
+) -> Result<Option<(String, Vec<u8>)>> {
+    let chosen = match mime {
+        Some(m) => m.to_string(),
+        None => {
+            let mut stmt = conn.prepare(
+                "SELECT mime FROM mime_parts WHERE entry_id = ?1 ORDER BY mime",
+            )?;
+            let mimes: Vec<String> = stmt
+                .query_map(params![id], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            let Some(picked) = mimes
+                .iter()
+                .find(|m| is_text_mime(m))
+                .cloned()
+                .or_else(|| mimes.into_iter().next())
+            else {
+                return Ok(None);
+            };
+            picked
+        }
+    };
+
+    let blob: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT blob FROM mime_parts WHERE entry_id = ?1 AND mime = ?2",
+            params![id, chosen],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(blob.map(|b| (chosen, b)))
+}
+
+fn row_to_tuple(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<(i64, i64, String, i64, Option<String>)> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+    ))
 }
 
 /// Spawn the storage worker on a named thread. Errors inside the worker are

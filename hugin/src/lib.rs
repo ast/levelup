@@ -1,10 +1,22 @@
 pub mod cli;
+pub mod ipc;
+pub mod proto;
 pub mod storage;
 pub mod wayland;
 
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tracing_subscriber::EnvFilter;
+
+/// Default unix-socket path for daemon ↔ CLI IPC: `$XDG_RUNTIME_DIR/hugin.sock`
+/// (falls back to `/tmp/hugin.sock`).
+pub fn default_socket_path() -> PathBuf {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join("hugin.sock")
+}
 
 /// Install a `tracing_subscriber` writing to stderr, honouring the `HUGIN_LOG`
 /// env var (falls back to `info`). Idempotent guard left to the caller —

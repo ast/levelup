@@ -42,16 +42,21 @@ schema:
 schema-of DB:
     cargo run --example schema -p hugin -- {{DB}}
 
-# End-to-end smoke test against a temp DB (overwrites your clipboard; needs wl-clipboard)
+# Run the hugin CLI (forward args after `--`, e.g. `just hugin -- list`)
+hugin *ARGS:
+    cargo run --quiet --bin hugin -p hugin -- {{ARGS}}
+
+# End-to-end smoke test against a temp DB + socket (overwrites your clipboard; needs wl-clipboard)
 smoke: build
     #!/usr/bin/env bash
     set -uo pipefail
     DB=/tmp/hugin-smoke.db
+    SOCK=/tmp/hugin-smoke.sock
     LOG=/tmp/hugin-smoke.log
-    rm -f "$DB" "$DB-wal" "$DB-shm" "$LOG"
+    rm -f "$DB" "$DB-wal" "$DB-shm" "$SOCK" "$LOG"
 
     echo ">> starting hugind (log: $LOG)"
-    HUGIN_LOG=debug ./target/debug/hugind --db "$DB" 2>"$LOG" &
+    HUGIN_LOG=debug ./target/debug/hugind --db "$DB" --socket "$SOCK" 2>"$LOG" &
     PID=$!
     trap 'kill $PID 2>/dev/null; wait $PID 2>/dev/null' EXIT
     sleep 0.5
@@ -73,17 +78,22 @@ smoke: build
     printf 'primary one' | wl-copy --primary
     sleep 0.2
 
+    echo ">> ipc: ping"
+    ./target/debug/hugin --socket "$SOCK" ping
+
+    echo ">> ipc: list"
+    ./target/debug/hugin --socket "$SOCK" list
+
+    LAST=$(./target/debug/hugin --socket "$SOCK" list --limit 1 | tail -1 | awk '{print $1}')
+    echo ">> ipc: info $LAST"
+    ./target/debug/hugin --socket "$SOCK" info "$LAST"
+    echo ">> ipc: get $LAST"
+    ./target/debug/hugin --socket "$SOCK" get "$LAST"; echo
+
     echo ">> stopping daemon"
     kill $PID 2>/dev/null
     wait $PID 2>/dev/null
     trap - EXIT
-
-    echo
-    echo "=== daemon log ==="
-    cat "$LOG"
-    echo
-    echo "=== database ==="
-    cargo run --example schema -p hugin -- "$DB" 2>/dev/null
 
     echo
     stored=$(grep -c 'stored ' "$LOG" || true)

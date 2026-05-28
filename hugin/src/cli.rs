@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::Parser;
 
+use crate::default_socket_path;
 use crate::storage::{default_db_path, RetentionConfig};
 
 #[derive(Debug, Parser)]
@@ -11,6 +12,10 @@ pub struct DaemonArgs {
     /// SQLite database path. Defaults to $XDG_DATA_HOME/hugin/hugin.db.
     #[arg(long, value_name = "PATH")]
     pub db: Option<PathBuf>,
+
+    /// Unix socket path. Defaults to $XDG_RUNTIME_DIR/hugin.sock.
+    #[arg(long, value_name = "PATH")]
+    pub socket: Option<PathBuf>,
 
     /// Maximum number of entries kept; older ones are pruned hourly.
     #[arg(long, default_value_t = 10_000)]
@@ -27,6 +32,10 @@ impl DaemonArgs {
             Some(p) => Ok(p.clone()),
             None => default_db_path(),
         }
+    }
+
+    pub fn socket_path(&self) -> PathBuf {
+        self.socket.clone().unwrap_or_else(default_socket_path)
     }
 
     pub fn retention(&self) -> RetentionConfig {
