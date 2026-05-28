@@ -55,8 +55,9 @@ smoke: build
     LOG=/tmp/hugin-smoke.log
     rm -f "$DB" "$DB-wal" "$DB-shm" "$SOCK" "$LOG"
 
-    echo ">> starting hugind (log: $LOG)"
-    HUGIN_LOG=debug ./target/debug/hugind --db "$DB" --socket "$SOCK" 2>"$LOG" &
+    # --primary so the primary-selection step actually exercises the watcher.
+    echo ">> starting hugind --primary (log: $LOG)"
+    HUGIN_LOG=debug ./target/debug/hugind --db "$DB" --socket "$SOCK" --primary 2>"$LOG" &
     PID=$!
     trap 'kill $PID 2>/dev/null; wait $PID 2>/dev/null' EXIT
     sleep 0.5
@@ -78,26 +79,42 @@ smoke: build
     printf 'primary one' | wl-copy --primary
     sleep 0.2
 
+    echo ">> password-manager hint: 'secret' (should be skipped)"
+    printf 'secret' | wl-copy --type x-kde-passwordManagerHint
+    sleep 0.2
+
     echo ">> ipc: ping"
     ./target/debug/hugin --socket "$SOCK" ping
 
     echo ">> ipc: list"
     ./target/debug/hugin --socket "$SOCK" list
 
-    LAST=$(./target/debug/hugin --socket "$SOCK" list --limit 1 | tail -1 | awk '{print $1}')
-    echo ">> ipc: info $LAST"
-    ./target/debug/hugin --socket "$SOCK" info "$LAST"
-    echo ">> ipc: get $LAST"
-    ./target/debug/hugin --socket "$SOCK" get "$LAST"; echo
+    # Pick the 'hello hugin' entry: second-newest regular before the dedup'd 'second copy'.
+    HELLO_ID=$(./target/debug/hugin --socket "$SOCK" list --selection regular --limit 2 | tail -1 | awk '{print $1}')
+    echo ">> ipc: info $HELLO_ID"
+    ./target/debug/hugin --socket "$SOCK" info "$HELLO_ID"
 
-    echo ">> stopping daemon"
-    kill $PID 2>/dev/null
-    wait $PID 2>/dev/null
+    echo ">> ipc: copy $HELLO_ID (daemon becomes source)"
+    ./target/debug/hugin --socket "$SOCK" copy "$HELLO_ID"
+    sleep 0.3
+    BACK=$(timeout 2 wl-paste --no-newline 2>/dev/null || echo "<wl-paste timed out>")
+    echo "   wl-paste reads back: '$BACK' (expected 'hello hugin')"
+
+    echo ">> SIGTERM (graceful shutdown)"
+    kill -TERM $PID
+    wait $PID
+    EXIT=$?
     trap - EXIT
+    echo "   exit status: $EXIT (expected 0)"
 
     echo
-    stored=$(grep -c 'stored ' "$LOG" || true)
-    dedup=$(grep -c 'dedup:'  "$LOG" || true)
-    echo "summary: stored=$stored dedup=$dedup"
-    echo "  expected (clean clipboard at start): stored=3 dedup=1"
-    echo "  (extra 'stored' entries are whatever was on your clipboard at startup)"
+    stored=$( grep -c 'stored '   "$LOG" || true)
+    dedup=$(  grep -c 'dedup:'    "$LOG" || true)
+    skipped=$(grep -c 'skipping clipboard content marked' "$LOG" || true)
+    echo "summary:"
+    echo "  stored=$stored   (expected 3: hello, second, primary)"
+    echo "  dedup=$dedup    (expected 1: the repeated 'second copy')"
+    echo "  skipped=$skipped (expected 1: the password-manager hint)"
+    echo "  copy round-trip: '$BACK' (expected 'hello hugin')"
+    echo "  clean-shutdown exit: $EXIT (expected 0)"
+    echo "  (extra 'stored' entries = whatever was on your clipboard at startup)"

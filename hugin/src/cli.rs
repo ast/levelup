@@ -24,6 +24,12 @@ pub struct DaemonArgs {
     /// Maximum age in days; older entries are pruned hourly.
     #[arg(long, default_value_t = 90)]
     pub max_age_days: u32,
+
+    /// Also watch the primary selection (text auto-selected by mouse,
+    /// pasted via middle-click). Off by default because text-drag selections
+    /// in many apps emit a steady stream of new MIMEs that crowd the history.
+    #[arg(long)]
+    pub primary: bool,
 }
 
 impl DaemonArgs {

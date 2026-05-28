@@ -5,7 +5,8 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::os::fd::AsFd;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 
 use anyhow::{Context, Result};
 use nix::fcntl::OFlag;
@@ -53,6 +54,8 @@ struct State {
     sources: HashMap<ZwlrDataControlSourceV1, SourceData>,
     manager: ZwlrDataControlManagerV1,
     device: ZwlrDataControlDeviceV1,
+    /// If false, primary-selection events are dropped without reading.
+    watch_primary: bool,
 }
 
 struct SourceData {
@@ -220,7 +223,14 @@ impl Dispatch<ZwlrDataControlDeviceV1, ()> for State {
                 state.handle_selection(Selection::Regular, id, conn);
             }
             zwlr_data_control_device_v1::Event::PrimarySelection { id } => {
-                state.handle_selection(Selection::Primary, id, conn);
+                if state.watch_primary {
+                    state.handle_selection(Selection::Primary, id, conn);
+                } else if let Some(offer) = id {
+                    // Not watching primary: clean up the offer object so it
+                    // doesn't accumulate in `state.offers`.
+                    state.offers.remove(&offer);
+                    offer.destroy();
+                }
             }
             zwlr_data_control_device_v1::Event::Finished => {
                 debug!("data device finished by compositor");
@@ -295,7 +305,15 @@ wayland_client::delegate_noop!(State: ignore ZwlrDataControlManagerV1);
 /// Connect to wayland, bind the wlr-data-control manager, and drive the event
 /// loop. The loop also polls `cmd_rx` for IPC-originated commands (e.g. copy
 /// requests); a short poll timeout keeps wake-up latency under 50 ms.
-pub fn run(capture_tx: mpsc::Sender<CapturedEntry>, cmd_rx: CmdReceiver) -> Result<()> {
+///
+/// Returns `Ok(())` when `shutdown` becomes true (graceful exit) and `Err(_)`
+/// on any wayland-side failure (lets systemd retry).
+pub fn run(
+    capture_tx: mpsc::Sender<CapturedEntry>,
+    cmd_rx: CmdReceiver,
+    watch_primary: bool,
+    shutdown: Arc<AtomicBool>,
+) -> Result<()> {
     let conn = Connection::connect_to_env().context("connect to wayland (WAYLAND_DISPLAY)")?;
     let (globals, mut event_queue) =
         registry_queue_init::<State>(&conn).context("registry init")?;
@@ -315,12 +333,17 @@ pub fn run(capture_tx: mpsc::Sender<CapturedEntry>, cmd_rx: CmdReceiver) -> Resu
         sources: HashMap::new(),
         manager,
         device,
+        watch_primary,
     };
-    info!("watching clipboard");
+    info!(watch_primary, "watching clipboard");
 
     let wayland_fd = conn.as_fd();
 
     loop {
+        if shutdown.load(Ordering::Relaxed) {
+            info!("shutdown requested; exiting wayland loop");
+            return Ok(());
+        }
         // 1. Drain IPC commands without blocking.
         loop {
             match cmd_rx.try_recv() {

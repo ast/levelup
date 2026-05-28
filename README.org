@@ -103,6 +103,38 @@ just smoke
 just schema   # peek at the live SQLite store
 #+end_src
 
+** Running under systemd
+
+For day-to-day use, run =hugind= as a user service tied to the graphical session. A ready-to-edit unit lives at [[file:dist/hugind.service][=dist/hugind.service=]].
+
+#+begin_src sh
+cargo install --path hugin --bin hugind                    # installs to ~/.cargo/bin
+mkdir -p ~/.config/systemd/user
+cp dist/hugind.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now hugind.service
+journalctl --user -u hugind.service -f                     # tail logs
+#+end_src
+
+Sway needs to publish =WAYLAND_DISPLAY= into the user manager and activate the target. Add to =~/.config/sway/config=:
+
+#+begin_src sh
+exec systemctl --user import-environment WAYLAND_DISPLAY XDG_CURRENT_DESKTOP
+exec systemctl --user start graphical-session.target
+#+end_src
+
+The unit uses =Type=notify=, so =systemctl --user start hugind= blocks until the daemon is ready. =PartOf=graphical-session.target= stops hugin when sway exits; =Restart=on-failure= retries transient errors (e.g. compositor restart) without thrashing.
+
+To pass flags (=--primary= for instance), override the unit:
+
+#+begin_src sh
+systemctl --user edit hugind.service
+# In the editor:
+# [Service]
+# ExecStart=
+# ExecStart=%h/.cargo/bin/hugind --primary
+#+end_src
+
 * Project layout
 
 - =hugin/= — clipboard crate; produces =hugind= (daemon) and =hugin= (CLI)
