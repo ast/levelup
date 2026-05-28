@@ -80,6 +80,6 @@ Hugin is being built in numbered milestones from a planning conversation. Quick 
 - **M0** (done) — log every clipboard change to stderr.
 - **M1** (done) — SQLite persistence, dedup, retention, off-thread storage writes.
 - **M2** (next) — `hugin` CLI + IPC. Daemon to serve a unix socket at `$XDG_RUNTIME_DIR/hugin.sock`. Wire protocol: JSON-lines for control + a raw-bytes trailer after a JSON header for `read-blob`. Subcommands: `list`, `get`, `copy`. This is where `tokio` is planned to enter the codebase.
-- **M3** — honour `x-kde-passwordManagerHint=secret` to skip password-manager clipboard contents.
+- **M3** (done) — honours `x-kde-passwordManagerHint=secret` (the convention used by KeePassXC, Bitwarden, 1Password) and skips persisting such entries. Implemented in `State::handle_selection`: if the MIME list contains `x-kde-passwordManagerHint` and its content trims to `"secret"`, the whole offer is destroyed and no MIMEs are read.
 - **M4** — config file, systemd user unit, graceful shutdown.
 - **Later** — MCP server exposing history to AI; cross-machine sync.

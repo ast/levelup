@@ -25,6 +25,11 @@ use wayland_protocols_wlr::data_control::v1::client::{
 
 use crate::{CapturedEntry, Selection};
 
+/// MIME advertised by password managers (KeePassXC, Bitwarden, 1Password, …)
+/// to tell clipboard managers "this selection is a secret; do not persist it".
+const PASSWORD_HINT_MIME: &str = "x-kde-passwordManagerHint";
+const PASSWORD_HINT_VALUE: &[u8] = b"secret";
+
 /// Commands sent from the IPC layer (tokio tasks) to the wayland thread.
 pub enum WaylandCmd {
     Copy {
@@ -82,6 +87,26 @@ impl State {
             warn!(sel = sel.as_str(), "offer committed with no MIMEs");
             offer.destroy();
             return;
+        }
+
+        // Honour the password-manager hint: if the source advertises one
+        // and its content reads back as the literal "secret", skip the entire
+        // offer before touching any of the (possibly sensitive) other MIMEs.
+        if mimes.iter().any(|m| m == PASSWORD_HINT_MIME) {
+            match read_offer(&offer, PASSWORD_HINT_MIME, conn) {
+                Ok(bytes) if bytes.trim_ascii() == PASSWORD_HINT_VALUE => {
+                    info!(
+                        sel = sel.as_str(),
+                        "skipping clipboard content marked as password-manager secret"
+                    );
+                    offer.destroy();
+                    return;
+                }
+                Ok(_) => {
+                    // Hint present but value isn't "secret"; treat normally.
+                }
+                Err(e) => warn!(error = %e, "failed to read password-hint MIME"),
+            }
         }
 
         let mut parts = Vec::with_capacity(mimes.len());

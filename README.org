@@ -8,7 +8,7 @@ A Rust workspace of personal-computing tools.
 
 ** hugin
 
-A Wayland clipboard manager for sway and other wlroots-based compositors. Watches the clipboard via =wlr-data-control-unstable-v1= and persists every selection change to SQLite. Both the *regular* selection (Ctrl-C / Ctrl-V) and the *primary* selection (mouse text selection / middle-click) are tracked as independent streams.
+A Wayland clipboard manager for sway and other wlroots-based compositors. Watches the clipboard via =wlr-data-control-unstable-v1= and persists every selection change to SQLite. Both the *regular* selection (Ctrl-C / Ctrl-V) and the *primary* selection (mouse text selection / middle-click) are tracked as independent streams. Honours the =x-kde-passwordManagerHint=secret= convention used by KeePassXC, Bitwarden, and 1Password to keep passwords out of history.
 
 Planned: expose history to AI via MCP; synchronize across machines.
 
