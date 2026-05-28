@@ -308,6 +308,27 @@ pub fn read_blob(
     Ok(blob.map(|b| (chosen, b)))
 }
 
+/// Load every (mime, blob) pair for an entry. Returns `None` if the entry
+/// id does not exist. Used by `hugin copy` to repopulate the clipboard.
+pub fn load_parts(conn: &Connection, id: i64) -> Result<Option<Vec<(String, Vec<u8>)>>> {
+    let exists: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM entries WHERE id = ?1",
+        params![id],
+        |r| r.get(0),
+    )?;
+    if exists == 0 {
+        return Ok(None);
+    }
+    let mut stmt =
+        conn.prepare("SELECT mime, blob FROM mime_parts WHERE entry_id = ?1 ORDER BY mime")?;
+    let parts: Vec<(String, Vec<u8>)> = stmt
+        .query_map(params![id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(Some(parts))
+}
+
 fn row_to_tuple(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<(i64, i64, String, i64, Option<String>)> {

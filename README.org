@@ -67,6 +67,7 @@ The =hugin= CLI talks to the running daemon over its unix socket. By default it 
 | =hugin list [--limit N] [--selection regular\|primary]= | Print recent entries, newest first.                  |
 | =hugin info ID=                                | Show metadata for one entry (timestamp, selection, MIMEs).    |
 | =hugin get ID [--mime MIME]=                   | Write the entry's contents to stdout. Default MIME is the first =text/*= advertised, falling back to the first available. |
+| =hugin copy ID [--selection regular\|primary]= | Put an old entry back on the clipboard. The daemon becomes the data source until another app takes over. |
 
 Examples:
 
@@ -86,8 +87,11 @@ hugin get 42
 # …or the HTML the source app also offered
 hugin get 42 --mime text/html
 
-# Round-trip an old entry back onto the clipboard
-hugin get 42 | wl-copy
+# Put an old entry back on the clipboard (daemon becomes the source)
+hugin copy 42
+
+# Same, but onto the primary selection
+hugin copy 42 --selection primary
 #+end_src
 
 ** Smoke test

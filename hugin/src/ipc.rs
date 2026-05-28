@@ -5,29 +5,43 @@
 //! `spawn_blocking` so they don't tie up tokio worker threads.
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::oneshot;
 use tracing::{info, warn};
 
 use crate::proto::{Request, Response};
-use crate::storage;
+use crate::wayland::{CmdSender, WaylandCmd};
+use crate::{storage, Selection};
 
 /// Bind to `socket_path` (cleaning a stale file if no live daemon owns it)
-/// and serve connections until the listener errors.
-pub async fn serve(socket_path: PathBuf, db_path: PathBuf) -> Result<()> {
+/// and serve connections until the listener errors. `cmd_tx` is the channel
+/// to the wayland thread (used for `copy` requests).
+pub async fn serve(
+    socket_path: PathBuf,
+    db_path: PathBuf,
+    cmd_tx: CmdSender,
+) -> Result<()> {
     bind_clean(&socket_path)?;
     let listener = UnixListener::bind(&socket_path)
         .with_context(|| format!("bind {}", socket_path.display()))?;
     info!(socket = %socket_path.display(), "ipc listening");
 
+    // std::sync::mpsc::Sender is Clone + Send but not Sync; wrap in a
+    // Mutex so multiple async tasks can grab it without contention beyond
+    // the brief moment of the send.
+    let cmd_tx = std::sync::Arc::new(Mutex::new(cmd_tx));
+
     loop {
         let (stream, _addr) = listener.accept().await.context("accept")?;
         let db_path = db_path.clone();
+        let cmd_tx = cmd_tx.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, db_path).await {
+            if let Err(e) = handle_connection(stream, db_path, cmd_tx).await {
                 warn!(error = %e, "ipc connection error");
             }
         });
@@ -50,7 +64,11 @@ fn bind_clean(path: &Path) -> Result<()> {
     }
 }
 
-async fn handle_connection(stream: UnixStream, db_path: PathBuf) -> Result<()> {
+async fn handle_connection(
+    stream: UnixStream,
+    db_path: PathBuf,
+    cmd_tx: std::sync::Arc<Mutex<CmdSender>>,
+) -> Result<()> {
     let (rd, mut wr) = stream.into_split();
     let mut reader = BufReader::new(rd);
     let mut line = String::new();
@@ -74,13 +92,14 @@ async fn handle_connection(stream: UnixStream, db_path: PathBuf) -> Result<()> {
                 continue;
             }
         };
-        dispatch(req, &db_path, &mut wr).await?;
+        dispatch(req, &db_path, &cmd_tx, &mut wr).await?;
     }
 }
 
 async fn dispatch<W: AsyncWriteExt + Unpin>(
     req: Request,
     db_path: &Path,
+    cmd_tx: &Mutex<CmdSender>,
     wr: &mut W,
 ) -> Result<()> {
     match req {
@@ -108,6 +127,44 @@ async fn dispatch<W: AsyncWriteExt + Unpin>(
                 Ok(Some(entry)) => write_response(wr, &Response::Entry { entry }).await,
                 Ok(None) => write_error(wr, format!("no entry with id {id}")).await,
                 Err(e) => write_error(wr, e.to_string()).await,
+            }
+        }
+        Request::Copy { id, selection } => {
+            let sel = match selection.as_deref() {
+                None | Some("regular") => Selection::Regular,
+                Some("primary") => Selection::Primary,
+                Some(other) => {
+                    return write_error(wr, format!("unknown selection {other:?}")).await;
+                }
+            };
+            let db = db_path.to_owned();
+            let parts_result = tokio::task::spawn_blocking(move || -> Result<_> {
+                let conn = Connection::open(&db)?;
+                storage::load_parts(&conn, id)
+            })
+            .await?;
+            let parts = match parts_result {
+                Ok(Some(p)) => p,
+                Ok(None) => return write_error(wr, format!("no entry with id {id}")).await,
+                Err(e) => return write_error(wr, e.to_string()).await,
+            };
+
+            let (reply_tx, reply_rx) = oneshot::channel();
+            let send_result = {
+                let guard = cmd_tx.lock().expect("cmd_tx poisoned");
+                guard.send(WaylandCmd::Copy {
+                    selection: sel,
+                    parts,
+                    reply: reply_tx,
+                })
+            };
+            if send_result.is_err() {
+                return write_error(wr, "wayland thread unavailable".into()).await;
+            }
+            match reply_rx.await {
+                Ok(Ok(())) => write_response(wr, &Response::Ok).await,
+                Ok(Err(e)) => write_error(wr, e.to_string()).await,
+                Err(_) => write_error(wr, "no reply from wayland thread".into()).await,
             }
         }
         Request::ReadBlob { id, mime } => {

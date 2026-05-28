@@ -46,6 +46,12 @@ enum Cmd {
         #[arg(long)]
         mime: Option<String>,
     },
+    /// Put an old entry back onto the clipboard
+    Copy {
+        id: i64,
+        #[arg(long, value_parser = ["regular", "primary"])]
+        selection: Option<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -99,6 +105,14 @@ fn main() -> Result<()> {
                 }
                 Response::Error { message } => return Err(anyhow!("{message}")),
                 other => return Err(unexpected("get", &other)),
+            }
+        }
+        Cmd::Copy { id, selection } => {
+            send(&mut writer, &Request::Copy { id, selection })?;
+            match read_response(&mut reader)? {
+                Response::Ok => {}
+                Response::Error { message } => return Err(anyhow!("{message}")),
+                other => return Err(unexpected("copy", &other)),
             }
         }
     }

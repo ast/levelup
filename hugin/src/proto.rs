@@ -39,6 +39,13 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mime: Option<String>,
     },
+    /// Make an old entry the current clipboard selection again. The daemon
+    /// becomes the data source until another app takes the selection.
+    Copy {
+        id: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selection: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
