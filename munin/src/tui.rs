@@ -171,6 +171,7 @@ fn handle_key(key: KeyEvent, state: &mut State) -> KeyOutcome {
         // ---- exit / accept ----------------------------------------------
         KeyCode::Esc => KeyOutcome::Cancel,
         KeyCode::Char('c') if ctrl => KeyOutcome::Cancel,
+        KeyCode::Char('g') if ctrl => KeyOutcome::Cancel,
         // Ctrl-D on empty: cancel (readline convention). Non-empty: delete
         // the char under the cursor (Emacs `delete-char`).
         KeyCode::Char('d') if ctrl => {
@@ -358,6 +359,11 @@ fn refresh_results(
             Layout::Top => 0,
         })
     };
+    // Reset the scroll offset before re-selecting. Otherwise a stale offset
+    // from a previous (larger) result set leaves the now-tiny list scrolled
+    // partway down its own slot, with empty rows visible between the items
+    // and the prompt.
+    *state.list_state.offset_mut() = 0;
     state.select(initial);
     Ok(())
 }
@@ -402,6 +408,7 @@ fn render_list(
         .iter()
         .map(|e| ListItem::new(render_row(e, match_fg)))
         .collect();
+    let item_count = items.len() as u16;
     let list = List::new(items)
         .highlight_style(
             Style::default()
@@ -410,7 +417,25 @@ fn render_list(
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("> ");
-    f.render_stateful_widget(list, area, &mut state.list_state);
+
+    // For Layout::Bottom (fzf-style) we want the items to sit flush against
+    // the bottom of the list area so the best match stays one row above the
+    // prompt no matter how many results we have. ratatui's List renders
+    // top→down, so when item_count < area.height we sub-split the area into
+    // [flexible top spacer | exactly-item_count rows] and render into the
+    // bottom slot. When item_count >= area.height the list fills the whole
+    // area and ratatui's normal scrolling kicks in.
+    let list_area = match cfg.layout {
+        Layout::Bottom if item_count < area.height => {
+            let chunks = LayoutWidget::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(0), Constraint::Length(item_count)])
+                .split(area);
+            chunks[1]
+        }
+        _ => area,
+    };
+    f.render_stateful_widget(list, list_area, &mut state.list_state);
 }
 
 /// One row: `<exit>  <duration>  <cmd-with-‹match›-highlights>`.
