@@ -65,3 +65,25 @@ trap '__munin_preexec' DEBUG
 if [[ "${PROMPT_COMMAND-}" != *__munin_precmd* ]]; then
     PROMPT_COMMAND="__munin_precmd${PROMPT_COMMAND:+; $PROMPT_COMMAND}"
 fi
+
+# Ctrl-R: replace bash's native history-search with the munin picker.
+# Exit-code contract from `munin search -i`:
+#   0  user hit Enter   → splice the chosen command (see caveat below)
+#   2  user hit Tab     → splice the chosen command for editing
+#   1  user hit Esc/^C  → leave the line untouched
+#
+# Caveat: bash's `bind -x` cannot trigger Enter from inside the bound
+# function — there is no `accept-line` equivalent reachable from a custom
+# readline binding. Both exit 0 and exit 2 therefore land the command on
+# the prompt; the user hits Enter to actually run it. zsh's hook honours
+# the distinction natively.
+_munin_search() {
+    local chosen rc
+    chosen=$(command munin search -i -- "$READLINE_LINE" </dev/tty 2>/dev/null)
+    rc=$?
+    case $rc in
+      0|2) READLINE_LINE=$chosen; READLINE_POINT=${#READLINE_LINE} ;;
+      *)   : ;;
+    esac
+}
+bind -x '"\C-R": _munin_search'

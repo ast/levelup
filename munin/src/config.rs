@@ -17,7 +17,7 @@ use crate::proto::SearchSort;
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// Initial sort mode for the TUI. `"relevance"` or `"recent"`.
-    pub sort: SortMode,
+    pub sort: SearchSort,
     /// Maximum rows fetched per keystroke. The list is short anyway so this
     /// mostly caps memory on very long queries.
     pub limit: usize,
@@ -29,29 +29,12 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            sort: SortMode::Relevance,
+            sort: SearchSort::Relevance,
             limit: 200,
             layout: Layout::Bottom,
             colors: Colors::default(),
         }
     }
-}
-
-impl Config {
-    /// Convert the config's sort into the wire-level enum.
-    pub fn sort_proto(&self) -> SearchSort {
-        match self.sort {
-            SortMode::Relevance => SearchSort::Relevance,
-            SortMode::Recent => SearchSort::Recent,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum SortMode {
-    Relevance,
-    Recent,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]

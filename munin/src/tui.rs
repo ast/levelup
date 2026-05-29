@@ -33,17 +33,30 @@ use ratatui::widgets::{List, ListItem, ListState, Paragraph};
 use rusqlite::Connection;
 
 use crate::config::{Config, Layout};
+use crate::fmt_dur;
 use crate::proto::{EntryMeta, Filters, SearchSort};
 use crate::storage;
 
-/// Run the TUI against the SQLite file at `db_path`. Returns the command
-/// the user picked (Enter), or `None` if they cancelled (Esc / Ctrl-C).
+/// What the user did. The bin layer maps each variant to a different exit
+/// code so the shell hook can distinguish "run this" from "drop this on the
+/// command line for me to edit" from "cancel".
+pub enum Outcome {
+    /// Enter: run the chosen command immediately. Bin exits 0.
+    Run(String),
+    /// Tab: drop the chosen command on the command line; the user edits and
+    /// runs it themselves. Bin exits 2.
+    Edit(String),
+    /// Esc / Ctrl-C / Ctrl-D on empty query: do nothing. Bin exits 1.
+    Cancel,
+}
+
+/// Run the TUI against the SQLite file at `db_path`.
 pub fn run(
     db_path: &Path,
     initial_query: String,
     filters: Filters,
     cfg: &Config,
-) -> Result<Option<String>> {
+) -> Result<Outcome> {
     let conn = Connection::open(db_path)
         .with_context(|| format!("open db {}", db_path.display()))?;
 
@@ -57,6 +70,9 @@ pub fn run(
 
 struct State {
     query: String,
+    /// Byte offset into `query`. Always on a UTF-8 char boundary; all
+    /// mutating handlers maintain this invariant.
+    cursor: usize,
     sort: SearchSort,
     results: Vec<EntryMeta>,
     list_state: ListState,
@@ -92,10 +108,12 @@ fn run_loop(
     initial_query: String,
     filters: Filters,
     cfg: &Config,
-) -> Result<Option<String>> {
+) -> Result<Outcome> {
+    let cursor = initial_query.len();
     let mut state = State {
         query: initial_query,
-        sort: cfg.sort_proto(),
+        cursor,
+        sort: cfg.sort,
         results: Vec::new(),
         list_state: ListState::default(),
     };
@@ -117,8 +135,19 @@ fn run_loop(
         match handle_key(key, &mut state) {
             KeyOutcome::Continue => {}
             KeyOutcome::Refresh => refresh_results(&mut state, conn, &filters, cfg)?,
-            KeyOutcome::Accept => return Ok(state.selected_cmd()),
-            KeyOutcome::Cancel => return Ok(None),
+            KeyOutcome::Accept => {
+                return Ok(state
+                    .selected_cmd()
+                    .map(Outcome::Run)
+                    .unwrap_or(Outcome::Cancel));
+            }
+            KeyOutcome::AcceptEdit => {
+                return Ok(state
+                    .selected_cmd()
+                    .map(Outcome::Edit)
+                    .unwrap_or(Outcome::Cancel));
+            }
+            KeyOutcome::Cancel => return Ok(Outcome::Cancel),
         }
     }
 }
@@ -128,8 +157,10 @@ enum KeyOutcome {
     Continue,
     /// Re-run the query (query/sort changed).
     Refresh,
-    /// Return the selected command.
+    /// Return the selected command for immediate execution.
     Accept,
+    /// Return the selected command for editing (don't execute).
+    AcceptEdit,
     /// Exit without a selection.
     Cancel,
 }
@@ -137,15 +168,35 @@ enum KeyOutcome {
 fn handle_key(key: KeyEvent, state: &mut State) -> KeyOutcome {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
+        // ---- exit / accept ----------------------------------------------
         KeyCode::Esc => KeyOutcome::Cancel,
         KeyCode::Char('c') if ctrl => KeyOutcome::Cancel,
-        KeyCode::Char('d') if ctrl && state.query.is_empty() => KeyOutcome::Cancel,
+        // Ctrl-D on empty: cancel (readline convention). Non-empty: delete
+        // the char under the cursor (Emacs `delete-char`).
+        KeyCode::Char('d') if ctrl => {
+            if state.query.is_empty() {
+                KeyOutcome::Cancel
+            } else {
+                delete_forward_char(state)
+            }
+        }
         KeyCode::Enter => KeyOutcome::Accept,
+        KeyCode::Tab => KeyOutcome::AcceptEdit,
+
+        // ---- list navigation --------------------------------------------
         KeyCode::Up => {
             state.move_selection(-1);
             KeyOutcome::Continue
         }
         KeyCode::Down => {
+            state.move_selection(1);
+            KeyOutcome::Continue
+        }
+        KeyCode::Char('p') if ctrl => {
+            state.move_selection(-1);
+            KeyOutcome::Continue
+        }
+        KeyCode::Char('n') if ctrl => {
             state.move_selection(1);
             KeyOutcome::Continue
         }
@@ -157,50 +208,128 @@ fn handle_key(key: KeyEvent, state: &mut State) -> KeyOutcome {
             state.move_selection(10);
             KeyOutcome::Continue
         }
-        // Tab or Ctrl-R cycles sort mode (matches atuin's Ctrl-R convention).
-        KeyCode::Tab | KeyCode::Char('r') if matches!(key.code, KeyCode::Tab) || ctrl => {
+
+        // ---- sort toggle ------------------------------------------------
+        // Atuin's convention: Ctrl-R cycles relevance ↔ recent. Tab is
+        // intentionally NOT bound to this any more (it now triggers Edit).
+        KeyCode::Char('r') if ctrl => {
             state.sort = match state.sort {
                 SearchSort::Relevance => SearchSort::Recent,
                 SearchSort::Recent => SearchSort::Relevance,
             };
             KeyOutcome::Refresh
         }
-        KeyCode::Backspace => {
-            if state.query.pop().is_some() {
-                KeyOutcome::Refresh
-            } else {
-                KeyOutcome::Continue
-            }
+
+        // ---- cursor movement (Emacs / readline) -------------------------
+        KeyCode::Left => move_cursor_back(state),
+        KeyCode::Right => move_cursor_forward(state),
+        KeyCode::Char('b') if ctrl => move_cursor_back(state),
+        KeyCode::Char('f') if ctrl => move_cursor_forward(state),
+        KeyCode::Home | KeyCode::Char('a') if matches!(key.code, KeyCode::Home) || ctrl => {
+            state.cursor = 0;
+            KeyOutcome::Continue
         }
-        // Ctrl-U clears the line (readline convention).
+        KeyCode::End | KeyCode::Char('e') if matches!(key.code, KeyCode::End) || ctrl => {
+            state.cursor = state.query.len();
+            KeyOutcome::Continue
+        }
+
+        // ---- editing ----------------------------------------------------
+        // Backspace and Ctrl-H are aliases — some terminals send 0x08
+        // (Ctrl-H) for the Backspace key, others send 0x7f (DEL).
+        KeyCode::Backspace => delete_back_char(state),
+        KeyCode::Char('h') if ctrl => delete_back_char(state),
+        KeyCode::Char('k') if ctrl => kill_to_end(state),
+        // Ctrl-U: kill the whole line (readline convention; Emacs binds
+        // this to negative argument, but readline / atuin / fzf all use it
+        // for line-kill which is what users expect here).
         KeyCode::Char('u') if ctrl => {
             if state.query.is_empty() {
                 KeyOutcome::Continue
             } else {
                 state.query.clear();
+                state.cursor = 0;
                 KeyOutcome::Refresh
             }
         }
-        // Ctrl-W deletes the previous word.
-        KeyCode::Char('w') if ctrl => {
-            let trimmed = state.query.trim_end();
-            let end = trimmed
-                .rfind(char::is_whitespace)
-                .map(|i| i + 1)
-                .unwrap_or(0);
-            if end != state.query.len() {
-                state.query.truncate(end);
-                KeyOutcome::Refresh
-            } else {
-                KeyOutcome::Continue
-            }
-        }
+        // Ctrl-W: delete previous word from the cursor.
+        KeyCode::Char('w') if ctrl => delete_back_word(state),
+
+        // ---- char input -------------------------------------------------
         KeyCode::Char(c) if !ctrl => {
-            state.query.push(c);
+            state.query.insert(state.cursor, c);
+            state.cursor += c.len_utf8();
             KeyOutcome::Refresh
         }
         _ => KeyOutcome::Continue,
     }
+}
+
+// ---- editing helpers ------------------------------------------------------
+
+fn prev_char_offset(s: &str, pos: usize) -> usize {
+    s[..pos].chars().next_back().map_or(0, |c| pos - c.len_utf8())
+}
+
+fn next_char_offset(s: &str, pos: usize) -> usize {
+    s[pos..].chars().next().map_or(s.len(), |c| pos + c.len_utf8())
+}
+
+fn move_cursor_back(state: &mut State) -> KeyOutcome {
+    state.cursor = prev_char_offset(&state.query, state.cursor);
+    KeyOutcome::Continue
+}
+
+fn move_cursor_forward(state: &mut State) -> KeyOutcome {
+    state.cursor = next_char_offset(&state.query, state.cursor);
+    KeyOutcome::Continue
+}
+
+fn delete_back_char(state: &mut State) -> KeyOutcome {
+    if state.cursor == 0 {
+        return KeyOutcome::Continue;
+    }
+    let prev = prev_char_offset(&state.query, state.cursor);
+    state.query.replace_range(prev..state.cursor, "");
+    state.cursor = prev;
+    KeyOutcome::Refresh
+}
+
+fn delete_forward_char(state: &mut State) -> KeyOutcome {
+    if state.cursor >= state.query.len() {
+        return KeyOutcome::Continue;
+    }
+    let next = next_char_offset(&state.query, state.cursor);
+    state.query.replace_range(state.cursor..next, "");
+    KeyOutcome::Refresh
+}
+
+fn kill_to_end(state: &mut State) -> KeyOutcome {
+    if state.cursor >= state.query.len() {
+        return KeyOutcome::Continue;
+    }
+    state.query.truncate(state.cursor);
+    KeyOutcome::Refresh
+}
+
+fn delete_back_word(state: &mut State) -> KeyOutcome {
+    if state.cursor == 0 {
+        return KeyOutcome::Continue;
+    }
+    // Find the start of the previous "word", skipping trailing whitespace
+    // first so " foo bar " + cursor-at-end yields "foo ".
+    let prefix = &state.query[..state.cursor];
+    let trimmed = prefix.trim_end();
+    let new_start = trimmed
+        .rfind(char::is_whitespace)
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    if new_start == state.cursor {
+        return KeyOutcome::Continue;
+    }
+    state.query.replace_range(new_start..state.cursor, "");
+    state.cursor = new_start;
+    KeyOutcome::Refresh
 }
 
 fn refresh_results(
@@ -209,13 +338,10 @@ fn refresh_results(
     filters: &Filters,
     cfg: &Config,
 ) -> Result<()> {
-    // Empty query → most recent entries (so the TUI opens to something
-    // useful before the user types anything). fzf does the same.
-    let mut results = if state.query.trim().is_empty() {
-        storage::list(conn, cfg.limit, filters)?
-    } else {
-        storage::search(conn, &state.query, false, state.sort, cfg.limit, filters)?
-    };
+    // `storage::search` handles the empty-query short-circuit internally
+    // (falls back to most-recent N), so we don't branch here. Non-empty
+    // queries go through nucleo fuzzy matching.
+    let mut results = storage::search(conn, &state.query, state.sort, cfg.limit, filters)?;
     // For fzf-style bottom layout we want the BEST/NEWEST match visually
     // nearest the prompt. ratatui's List renders top→down, so reverse the
     // vector: index 0 ends up at the top of the list area (worst/oldest),
@@ -356,7 +482,7 @@ fn render_status(
         SearchSort::Recent => "recent",
     };
     let text = format!(
-        " {n} match{plural}  [{sort}]   Enter accept · Esc cancel · Tab toggle sort",
+        " {n} match{plural}  [{sort}]   Enter run · Tab edit · Esc cancel · ^R toggle sort",
         n = state.results.len(),
         plural = if state.results.len() == 1 { "" } else { "es" },
     );
@@ -381,26 +507,14 @@ fn render_prompt(
         Span::raw(state.query.clone()),
     ]);
     f.render_widget(Paragraph::new(line), area);
-    // Park the terminal cursor right after the query so the user can see
-    // where the next char will land. Use saturating arithmetic — when the
-    // pty hasn't negotiated yet (width=0) the naive `area.x + area.width - 1`
-    // underflows.
+    // Park the terminal cursor at the *byte* offset stored in `state.cursor`,
+    // converted to a column. Use saturating arithmetic — when the pty hasn't
+    // negotiated yet (width=0) the naive `area.x + area.width - 1` underflows.
     if area.width > 0 {
-        let cursor_x = (area.x + 2).saturating_add(state.query.chars().count() as u16);
+        let chars_before = state.query[..state.cursor].chars().count() as u16;
+        let cursor_x = (area.x + 2).saturating_add(chars_before);
         let max_x = area.x.saturating_add(area.width).saturating_sub(1);
         f.set_cursor_position((cursor_x.min(max_x), area.y));
-    }
-}
-
-fn fmt_dur(ms: Option<i64>) -> String {
-    let Some(ms) = ms else { return "-".into() };
-    if ms < 1000 {
-        format!("{ms}ms")
-    } else if ms < 60_000 {
-        format!("{:.1}s", ms as f64 / 1000.0)
-    } else {
-        let s = ms / 1000;
-        format!("{}m{:02}s", s / 60, s % 60)
     }
 }
 

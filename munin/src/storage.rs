@@ -1,9 +1,12 @@
 //! Storage layer: SQLite Store + the storage worker thread.
 //!
-//! The `Connection` is owned by exactly one OS thread (`munin-storage`).
-//! `munind` sends write commands via `mpsc<StoreCmd>`. Reads
-//! (`list`/`search`/`get`) open ephemeral `Connection`s from inside
-//! `spawn_blocking` tokio tasks — WAL mode makes that safe.
+//! `munind`'s `Connection` is owned by exactly one OS thread
+//! (`munin-storage`) and reached via `mpsc<StoreCmd>` for the daemon's
+//! writes (captures + imports). Reads (`list`/`search`/`get`) are NOT
+//! routed through the daemon at all — the CLI opens its own
+//! `Connection` directly against the SQLite file (`bin/munin.rs::run_read`)
+//! and calls the standalone functions at the bottom of this module. WAL
+//! mode makes the concurrent read safe alongside the daemon's writer.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
@@ -15,14 +18,15 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use tokio::sync::oneshot;
 use tracing::{debug, info, warn};
-use uuid::Uuid;
+use uuid::{NoContext, Timestamp, Uuid};
 
 use crate::proto::{EntryMeta, Filters, SearchSort};
 
 /// Schema version stored in `PRAGMA user_version`. Bump when the on-disk
 /// shape changes incompatibly; `Store::open` refuses to start on mismatch.
-/// v1 = entries + config; v2 = adds entries_fts (FTS5) + entries_ad trigger.
-const DB_VERSION: i32 = 2;
+/// v1 = entries + config. (FTS5 was tried briefly at v2 and removed once
+/// search moved to in-process nucleo fuzzy matching.)
+const DB_VERSION: i32 = 1;
 
 const SCHEMA_SQL: &str = "
 CREATE TABLE IF NOT EXISTS entries (
@@ -48,21 +52,12 @@ CREATE TABLE IF NOT EXISTS config (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
-
-CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(content);
-
--- The FK CASCADE on related tables doesn't reach virtual tables, so this
--- trigger is load-bearing: without it, retention or manual DELETEs would
--- leave orphaned FTS rows that still match searches.
-CREATE TRIGGER IF NOT EXISTS entries_ad AFTER DELETE ON entries BEGIN
-    DELETE FROM entries_fts WHERE rowid = OLD.id;
-END;
 ";
 
-/// Upper bound on `limit` for list/search queries. Caps the result set so an
-/// IPC peer can't force the daemon to materialise the entire table — and
-/// in particular guards against `usize::MAX as i64 == -1`, which SQLite
-/// would otherwise interpret as "no limit".
+/// Upper bound on `limit` for list/search queries. Caps the result set so a
+/// caller can't force materialising the entire table — and in particular
+/// guards against `usize::MAX as i64 == -1`, which SQLite would otherwise
+/// interpret as "no limit".
 pub const MAX_LIMIT: usize = 10_000;
 
 /// Static SQL for `list` — newest first with the standard filter pattern
@@ -76,37 +71,6 @@ const LIST_SQL: &str = "\
       AND (?4 IS NULL OR ts_unix_ns >= ?4) \
       AND (?5 IS NULL OR ts_unix_ns <= ?5) \
     ORDER BY id DESC LIMIT ?6";
-
-// FTS5 search. Two variants only differ in ORDER BY; column list and snippet
-// markers (`‹›/…/16`) stay in sync. The `snippet()` arguments are the FTS
-// column index (0 = our `content` column), open marker, close marker,
-// ellipsis, and token-count budget — keep these aligned with the CLI's table
-// width if you tune one.
-const SEARCH_SQL_RELEVANCE: &str = "\
-    SELECT e.id, e.uuid, e.cmd, e.ts_unix_ns, e.cwd, e.hostname, e.session, e.shell, \
-           e.exit_code, e.duration_ms, snippet(entries_fts, 0, '‹', '›', '…', 16) \
-    FROM entries_fts \
-    JOIN entries e ON e.id = entries_fts.rowid \
-    WHERE entries_fts MATCH ?1 \
-      AND (?2 IS NULL OR e.cwd = ?2) \
-      AND (?3 IS NULL OR e.session = ?3) \
-      AND (?4 IS NULL OR e.shell = ?4) \
-      AND (?5 IS NULL OR e.ts_unix_ns >= ?5) \
-      AND (?6 IS NULL OR e.ts_unix_ns <= ?6) \
-    ORDER BY bm25(entries_fts) ASC, e.id DESC LIMIT ?7";
-
-const SEARCH_SQL_RECENT: &str = "\
-    SELECT e.id, e.uuid, e.cmd, e.ts_unix_ns, e.cwd, e.hostname, e.session, e.shell, \
-           e.exit_code, e.duration_ms, snippet(entries_fts, 0, '‹', '›', '…', 16) \
-    FROM entries_fts \
-    JOIN entries e ON e.id = entries_fts.rowid \
-    WHERE entries_fts MATCH ?1 \
-      AND (?2 IS NULL OR e.cwd = ?2) \
-      AND (?3 IS NULL OR e.session = ?3) \
-      AND (?4 IS NULL OR e.shell = ?4) \
-      AND (?5 IS NULL OR e.ts_unix_ns >= ?5) \
-      AND (?6 IS NULL OR e.ts_unix_ns <= ?6) \
-    ORDER BY e.id DESC LIMIT ?7";
 
 const GET_SQL: &str = "\
     SELECT id, uuid, cmd, ts_unix_ns, cwd, hostname, session, shell, exit_code, duration_ms \
@@ -129,7 +93,8 @@ pub enum StoreCmd {
     },
     Import {
         path: PathBuf,
-        shell: String,
+        /// `"zsh"` / `"bash"` (text history files) or `"atuin"` (SQLite DB).
+        source: String,
         reply: oneshot::Sender<Result<usize>>,
     },
 }
@@ -181,9 +146,6 @@ impl Store {
     /// Insert a row for the just-started command and remember its row id so
     /// the matching `AddEnd` can close it out. `cmd` is dropped silently if it
     /// begins with whitespace (atuin / `HIST_IGNORE_SPACE` convention).
-    /// The `entries` row and the matching `entries_fts` row are inserted in
-    /// the same transaction so a partial commit can't leave a searchable row
-    /// without metadata or vice versa.
     pub fn add_start(
         &mut self,
         cmd: &str,
@@ -198,8 +160,7 @@ impl Store {
             return Ok(None);
         }
         let uuid = Uuid::now_v7().to_string();
-        let tx = self.conn.transaction()?;
-        tx.execute(
+        self.conn.execute(
             "INSERT INTO entries (uuid, client_id, cmd, ts_unix_ns, cwd, hostname, session, shell)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
@@ -213,12 +174,7 @@ impl Store {
                 shell,
             ],
         )?;
-        let id = tx.last_insert_rowid();
-        tx.execute(
-            "INSERT INTO entries_fts (rowid, content) VALUES (?1, ?2)",
-            params![id, cmd],
-        )?;
-        tx.commit()?;
+        let id = self.conn.last_insert_rowid();
         self.open.insert(session.to_owned(), (id, ts_unix_ns));
         Ok(Some(id))
     }
@@ -243,6 +199,83 @@ impl Store {
         Ok(Some(id))
     }
 
+    /// Bulk-import from an atuin SQLite database (`history.db`).
+    ///
+    /// Atuin's id is itself a UUIDv7, so we preserve it as munin's `uuid` —
+    /// that makes re-imports idempotent (the UNIQUE constraint on `uuid`
+    /// drops dupes via `INSERT OR IGNORE`), and gives us the same identity
+    /// space we'd want for sync later. `shell` is set to `"atuin"` so
+    /// imported rows can be filtered with `--shell atuin`.
+    pub fn import_atuin_db(&mut self, db_path: &Path) -> Result<usize> {
+        use rusqlite::OpenFlags;
+        let src = Connection::open_with_flags(
+            db_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| format!("open atuin db {}", db_path.display()))?;
+
+        // Skip soft-deleted rows. ORDER BY timestamp gives us a stable, useful
+        // shape but isn't load-bearing — UUIDv7 preserves the time order.
+        let mut stmt = src.prepare(
+            "SELECT id, command, timestamp, duration, exit, cwd, session, hostname \
+             FROM history WHERE deleted_at IS NULL ORDER BY timestamp",
+        )?;
+        let rows: Vec<AtuinRow> = stmt
+            .query_map([], |r| {
+                Ok(AtuinRow {
+                    uuid: r.get(0)?,
+                    cmd: r.get(1)?,
+                    ts_unix_ns: r.get(2)?,
+                    duration_ns: r.get(3)?,
+                    exit_code: r.get(4)?,
+                    cwd: r.get(5)?,
+                    session: r.get(6)?,
+                    hostname: r.get(7)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        drop(stmt);
+        drop(src);
+
+        let total = rows.len();
+        let tx = self.conn.transaction().context("begin atuin import tx")?;
+        let mut inserted = 0usize;
+        {
+            // INSERT OR IGNORE: a second import of the same atuin DB silently
+            // drops dupes (uuid UNIQUE), so the operation is idempotent.
+            let mut insert_entry = tx.prepare(
+                "INSERT OR IGNORE INTO entries \
+                 (uuid, client_id, cmd, ts_unix_ns, cwd, hostname, session, shell, exit_code, duration_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            )?;
+            for row in rows {
+                let duration_ms = if row.duration_ns > 0 {
+                    Some(row.duration_ns / 1_000_000)
+                } else {
+                    None
+                };
+                let affected = insert_entry.execute(params![
+                    row.uuid,
+                    self.client_id,
+                    row.cmd,
+                    row.ts_unix_ns,
+                    row.cwd,
+                    row.hostname,
+                    row.session,
+                    "atuin",
+                    row.exit_code,
+                    duration_ms,
+                ])?;
+                if affected > 0 {
+                    inserted += 1;
+                }
+            }
+        }
+        tx.commit().context("commit atuin import tx")?;
+        info!(scanned = total, inserted, "atuin import done");
+        Ok(inserted)
+    }
+
     /// Bulk-import a shell-history file. `shell` is recorded on every row
     /// (so imported entries are filterable later) and selects which parser
     /// to use. All inserts happen inside one transaction.
@@ -261,13 +294,12 @@ impl Store {
                  (uuid, client_id, cmd, ts_unix_ns, hostname, shell, duration_ms) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )?;
-            let mut insert_fts =
-                tx.prepare("INSERT INTO entries_fts (rowid, content) VALUES (?1, ?2)")?;
             for e in entries {
-                // UUIDv7 with the entry's timestamp so imports sort right next
-                // to live captures. We don't pass cwd/session/exit_code —
-                // shell history files don't carry them.
-                let uuid = Uuid::now_v7().to_string();
+                // UUIDv7 carries the entry's own timestamp (not the import
+                // time) so imported rows sort next to live captures from
+                // the same era. We don't pass cwd/session/exit_code — shell
+                // history files don't carry them.
+                let uuid = uuid_for_ts(e.ts_unix_ns).to_string();
                 insert_entry.execute(params![
                     uuid,
                     self.client_id,
@@ -277,8 +309,6 @@ impl Store {
                     shell,
                     e.duration_ms,
                 ])?;
-                let id = tx.last_insert_rowid();
-                insert_fts.execute(params![id, e.cmd])?;
                 inserted += 1;
             }
         }
@@ -311,20 +341,10 @@ fn ensure_client_id(conn: &Connection) -> Result<String> {
 }
 
 /// Refuse to open a database produced by a different schema generation.
-/// Fresh DBs (no `entries` table yet) pass through; v2 DBs must additionally
-/// have the FTS5 virtual table present (rebuilding it silently would hide
-/// historical rows from search).
+/// Fresh DBs (no `entries` table yet) pass through unconditionally.
 fn ensure_compatible_schema(conn: &Connection, path: &Path) -> Result<()> {
     let version: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if version == DB_VERSION {
-        if !table_exists(conn, "entries_fts")? {
-            bail!(
-                "munin database at {} is at schema v{version} but entries_fts is missing; \
-                 the search index has been dropped out-of-band. Delete the file and restart \
-                 to recreate.",
-                path.display(),
-            );
-        }
         return Ok(());
     }
     if version == 0 && !table_exists(conn, "entries")? {
@@ -335,6 +355,18 @@ fn ensure_compatible_schema(conn: &Connection, path: &Path) -> Result<()> {
          No automatic migration; delete the file and restart to recreate.",
         path.display(),
     );
+}
+
+/// Build a UUIDv7 whose embedded timestamp is `ts_unix_ns` (instead of the
+/// wall-clock-now used by `Uuid::now_v7()`). Used by `import_file` so the
+/// imported row's uuid sorts next to live captures from the same era.
+/// Negative `ts_unix_ns` (shouldn't happen — captures and synthesised
+/// timestamps are non-negative) clamps to the epoch.
+fn uuid_for_ts(ts_unix_ns: i64) -> Uuid {
+    let ns = ts_unix_ns.max(0);
+    let secs = (ns / 1_000_000_000) as u64;
+    let subsec_nanos = (ns % 1_000_000_000) as u32;
+    Uuid::new_v7(Timestamp::from_unix(NoContext, secs, subsec_nanos))
 }
 
 fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
@@ -390,13 +422,17 @@ pub fn run_storage_thread(mut store: Store, rx: mpsc::Receiver<StoreCmd>) {
             },
             StoreCmd::Import {
                 path,
-                shell,
+                source,
                 reply,
             } => {
-                let result = store.import_file(&path, &shell);
+                let result = match source.as_str() {
+                    "zsh" | "bash" => store.import_file(&path, &source),
+                    "atuin" => store.import_atuin_db(&path),
+                    other => Err(anyhow::anyhow!("unsupported import source: {other}")),
+                };
                 match &result {
-                    Ok(n) => info!(inserted = n, path = %path.display(), shell, "import"),
-                    Err(e) => warn!(error = %e, path = %path.display(), "import failed"),
+                    Ok(n) => info!(inserted = n, path = %path.display(), source, "import"),
+                    Err(e) => warn!(error = %e, path = %path.display(), source, "import failed"),
                 }
                 // If the receiver was dropped (peer disconnected), we just
                 // discard the result — the work is done either way.
@@ -420,7 +456,7 @@ pub fn spawn_storage_thread(
         .context("spawn storage thread")
 }
 
-// ---- read API used by IPC's spawn_blocking tasks --------------------------
+// ---- read API (called directly by the CLI / TUI) -------------------------
 
 pub fn list(conn: &Connection, limit: usize, filters: &Filters) -> Result<Vec<EntryMeta>> {
     let limit = limit.min(MAX_LIMIT) as i64;
@@ -439,51 +475,95 @@ pub fn list(conn: &Connection, limit: usize, filters: &Filters) -> Result<Vec<En
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-/// FTS5 search. `query` is treated as a single phrase (wrapped in double
-/// quotes, embedded `"` doubled) unless `raw` is set — then it's passed
-/// through verbatim so the user can use FTS5 operators like `AND`, `OR`,
-/// `NEAR`, prefix wildcards `foo*`, etc. Empty/whitespace queries
-/// short-circuit so we don't ship `""` to FTS5 (which would raise a syntax
-/// error).
+/// Fuzzy search over the recent-entries pool using nucleo-matcher.
+///
+/// Empty / whitespace-only queries fall through to `list` (most-recent N,
+/// no scoring, no snippets). Non-empty queries pull up to `MAX_LIMIT`
+/// candidates via `list_with_filters` and score each `cmd` with nucleo's
+/// fzf-style algorithm; non-matches are dropped. `EntryMeta.snippet` is
+/// built from the matched codepoint indices and wraps matched chars in
+/// `‹…›`, matching the markers the TUI's `highlight_snippet` already
+/// understands.
 pub fn search(
     conn: &Connection,
     query: &str,
-    raw: bool,
     sort: SearchSort,
     limit: usize,
     filters: &Filters,
 ) -> Result<Vec<EntryMeta>> {
     let trimmed = query.trim();
     if trimmed.is_empty() {
-        return Ok(Vec::new());
+        return list(conn, limit, filters);
     }
-    let match_expr = if raw {
-        query.to_owned()
-    } else {
-        // FTS5 phrase literal: wrap in double quotes, doubling embedded ones.
-        // Trim leading/trailing whitespace so "git " behaves like "git" (a
-        // trailing space inside the phrase makes FTS5 match nothing).
-        format!("\"{}\"", trimmed.replace('"', "\"\""))
-    };
-    let limit = limit.min(MAX_LIMIT) as i64;
-    let sql = match sort {
-        SearchSort::Relevance => SEARCH_SQL_RELEVANCE,
-        SearchSort::Recent => SEARCH_SQL_RECENT,
-    };
-    let mut stmt = conn.prepare(sql)?;
-    let rows = stmt.query_map(
-        params![
-            match_expr,
-            filters.cwd,
-            filters.session,
-            filters.shell,
-            filters.since,
-            filters.until,
-            limit,
-        ],
-        row_to_entry_with_snippet,
-    )?;
-    Ok(rows.collect::<rusqlite::Result<_>>()?)
+
+    // Filters still apply at the SQL layer; the in-memory pool is bounded
+    // by MAX_LIMIT so we don't blow up on huge DBs.
+    let pool = list(conn, MAX_LIMIT, filters)?;
+
+    let mut matcher = nucleo_matcher::Matcher::new(nucleo_matcher::Config::DEFAULT);
+    let pattern = nucleo_matcher::pattern::Pattern::parse(
+        trimmed,
+        nucleo_matcher::pattern::CaseMatching::Smart,
+        nucleo_matcher::pattern::Normalization::Smart,
+    );
+
+    let mut hay_buf = Vec::new();
+    let mut idx_buf = Vec::new();
+    let mut scored: Vec<(u32, EntryMeta)> = Vec::with_capacity(pool.len());
+    for mut entry in pool {
+        idx_buf.clear();
+        let haystack = nucleo_matcher::Utf32Str::new(&entry.cmd, &mut hay_buf);
+        if let Some(score) = pattern.indices(haystack, &mut matcher, &mut idx_buf) {
+            // nucleo doesn't guarantee sorted indices; sort once before we
+            // walk them in highlight_indices.
+            idx_buf.sort_unstable();
+            entry.snippet = Some(highlight_indices(&entry.cmd, &idx_buf));
+            scored.push((score, entry));
+        }
+    }
+
+    match sort {
+        SearchSort::Relevance => {
+            // Score desc, tiebreak by id desc (newer first).
+            scored.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.id.cmp(&a.1.id)));
+        }
+        SearchSort::Recent => {
+            scored.sort_by_key(|s| std::cmp::Reverse(s.1.id));
+        }
+    }
+
+    let limit = limit.min(MAX_LIMIT);
+    Ok(scored.into_iter().take(limit).map(|(_, e)| e).collect())
+}
+
+/// Walk `s` codepoint by codepoint; wrap runs of matched positions
+/// (`indices`, sorted ascending) in `‹…›`. The TUI's `highlight_snippet`
+/// parses these markers to colour the matched runs.
+fn highlight_indices(s: &str, indices: &[u32]) -> String {
+    let mut out = String::with_capacity(s.len() + indices.len() * 4);
+    let mut idx_iter = indices.iter().copied().peekable();
+    let mut in_match = false;
+    for (i, c) in s.chars().enumerate() {
+        let is_match = idx_iter.peek() == Some(&(i as u32));
+        if is_match {
+            if !in_match {
+                out.push('‹');
+                in_match = true;
+            }
+            out.push(c);
+            idx_iter.next();
+        } else {
+            if in_match {
+                out.push('›');
+                in_match = false;
+            }
+            out.push(c);
+        }
+    }
+    if in_match {
+        out.push('›');
+    }
+    out
 }
 
 pub fn get(conn: &Connection, id: i64) -> Result<Option<EntryMeta>> {
@@ -508,22 +588,6 @@ fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<EntryMeta> {
     })
 }
 
-fn row_to_entry_with_snippet(row: &rusqlite::Row<'_>) -> rusqlite::Result<EntryMeta> {
-    Ok(EntryMeta {
-        id: row.get(0)?,
-        uuid: row.get(1)?,
-        cmd: row.get(2)?,
-        ts_unix_ns: row.get(3)?,
-        cwd: row.get(4)?,
-        hostname: row.get(5)?,
-        session: row.get(6)?,
-        shell: row.get(7)?,
-        exit_code: row.get(8)?,
-        duration_ms: row.get(9)?,
-        snippet: row.get(10)?,
-    })
-}
-
 // ---- history file parsers -------------------------------------------------
 
 /// One parsed history line. Only the bits the file format actually carries.
@@ -531,6 +595,18 @@ struct ParsedEntry {
     cmd: String,
     ts_unix_ns: i64,
     duration_ms: Option<i64>,
+}
+
+/// One row read out of atuin's `history` table.
+struct AtuinRow {
+    uuid: String,
+    cmd: String,
+    ts_unix_ns: i64,
+    duration_ns: i64,
+    exit_code: i32,
+    cwd: Option<String>,
+    session: Option<String>,
+    hostname: Option<String>,
 }
 
 /// Parse `.zsh_history`. Supports both extended (`: <ts>:<dur>;<cmd>`) and

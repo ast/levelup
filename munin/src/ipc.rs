@@ -4,21 +4,24 @@
 //! Each accepted connection runs as its own tokio task and serves a
 //! request stream until EOF.
 //!
+//! The surface is deliberately narrow: only ops that touch shared mutable
+//! state live here.
+//!
+//! - `ping` writes `{"kind":"ok"}` — a liveness probe used by `bind_clean`.
 //! - Capture commands (`add-start`, `add-end`) are forwarded to the storage
-//!   thread and produce **no response** — the client is expected to write
-//!   the request and exit without reading.
-//! - Read commands (`ping`, `list`, `search`, `get`) write a single JSON
-//!   response. Reads open an ephemeral `Connection` inside `spawn_blocking`;
-//!   WAL mode makes that safe alongside the storage thread's writer.
+//!   thread and produce **no response** — the client writes the request
+//!   and exits without reading.
 //! - `import` writes a `StoreCmd::Import` with a oneshot reply channel and
-//!   blocks the IPC task on it; the work itself runs on the storage thread.
+//!   awaits it; the work itself runs on the storage thread.
+//!
+//! Read commands (`list` / `search` / `get`) are NOT served over IPC — the
+//! CLI opens the SQLite file directly. See `bin/munin.rs::run_read`.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::mpsc;
 
 use anyhow::{Context, Result};
-use rusqlite::Connection;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::oneshot;
@@ -26,13 +29,13 @@ use tracing::{info, warn};
 
 use crate::now_unix_ns;
 use crate::proto::{Request, Response};
-use crate::storage::{self, StoreCmd};
+use crate::storage::StoreCmd;
 
 pub type StoreTx = mpsc::Sender<StoreCmd>;
 
 /// Bind to `socket_path` (cleaning a stale file if no live daemon owns it)
 /// and serve connections until the listener errors.
-pub async fn serve(socket_path: PathBuf, db_path: PathBuf, store_tx: StoreTx) -> Result<()> {
+pub async fn serve(socket_path: PathBuf, store_tx: StoreTx) -> Result<()> {
     bind_clean(&socket_path)?;
     let listener = UnixListener::bind(&socket_path)
         .with_context(|| format!("bind {}", socket_path.display()))?;
@@ -46,9 +49,8 @@ pub async fn serve(socket_path: PathBuf, db_path: PathBuf, store_tx: StoreTx) ->
     loop {
         let (stream, _addr) = listener.accept().await.context("accept")?;
         let store_tx = store_tx.clone();
-        let db_path = db_path.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, db_path, store_tx).await {
+            if let Err(e) = handle_connection(stream, store_tx).await {
                 warn!(error = %e, "ipc connection error");
             }
         });
@@ -73,7 +75,6 @@ fn bind_clean(path: &Path) -> Result<()> {
 
 async fn handle_connection(
     stream: UnixStream,
-    db_path: PathBuf,
     store_tx: std::sync::Arc<Mutex<StoreTx>>,
 ) -> Result<()> {
     let (rd, mut wr) = stream.into_split();
@@ -99,13 +100,12 @@ async fn handle_connection(
                 continue;
             }
         };
-        dispatch(req, &db_path, &store_tx, &mut wr).await?;
+        dispatch(req, &store_tx, &mut wr).await?;
     }
 }
 
 async fn dispatch<W: AsyncWriteExt + Unpin>(
     req: Request,
-    db_path: &Path,
     store_tx: &Mutex<StoreTx>,
     wr: &mut W,
 ) -> Result<()> {
@@ -155,56 +155,13 @@ async fn dispatch<W: AsyncWriteExt + Unpin>(
             }
             Ok(())
         }
-        Request::List { limit, filters } => {
-            let db = db_path.to_owned();
-            let result = tokio::task::spawn_blocking(move || -> Result<_> {
-                let conn = Connection::open(&db)?;
-                storage::list(&conn, limit.unwrap_or(50), &filters)
-            })
-            .await?;
-            match result {
-                Ok(entries) => write_response(wr, &Response::Entries { entries }).await,
-                Err(e) => write_error(wr, e.to_string()).await,
-            }
-        }
-        Request::Search {
-            query,
-            raw,
-            sort,
-            limit,
-            filters,
-        } => {
-            let db = db_path.to_owned();
-            let result = tokio::task::spawn_blocking(move || -> Result<_> {
-                let conn = Connection::open(&db)?;
-                storage::search(&conn, &query, raw, sort, limit.unwrap_or(50), &filters)
-            })
-            .await?;
-            match result {
-                Ok(entries) => write_response(wr, &Response::Entries { entries }).await,
-                Err(e) => write_error(wr, e.to_string()).await,
-            }
-        }
-        Request::Get { id } => {
-            let db = db_path.to_owned();
-            let result = tokio::task::spawn_blocking(move || -> Result<_> {
-                let conn = Connection::open(&db)?;
-                storage::get(&conn, id)
-            })
-            .await?;
-            match result {
-                Ok(Some(entry)) => write_response(wr, &Response::Entry { entry }).await,
-                Ok(None) => write_error(wr, format!("no entry with id {id}")).await,
-                Err(e) => write_error(wr, e.to_string()).await,
-            }
-        }
-        Request::Import { path, shell } => {
+        Request::Import { path, source } => {
             let (reply_tx, reply_rx) = oneshot::channel();
             let send_result = {
                 let guard = store_tx.lock().expect("store_tx poisoned");
                 guard.send(StoreCmd::Import {
                     path: PathBuf::from(path),
-                    shell,
+                    source,
                     reply: reply_tx,
                 })
             };

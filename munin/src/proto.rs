@@ -1,10 +1,14 @@
 //! Wire types shared between the daemon and the `munin` CLI.
 //!
-//! All control messages are one JSON object per line. Reads (`ping`,
-//! `list`, `search`, `get`, `import`) get a one-line JSON response.
-//! Captures (`add-start` / `add-end`) are fire-and-forget — the daemon
-//! does not write a response, so the client can write the line and exit
-//! without waiting for a round trip.
+//! All control messages are one JSON object per line. The daemon-routed
+//! ops are deliberately narrow: `ping` and `import` get a one-line JSON
+//! response, and the captures (`add-start` / `add-end`) are
+//! fire-and-forget — the daemon does not write a response, so the shell
+//! hook can write the line and exit without waiting for a round trip.
+//!
+//! Read ops (`list` / `search` / `get`) live in `storage::*` and are
+//! called directly by the CLI against the SQLite file; they don't go
+//! through this protocol.
 
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
@@ -27,8 +31,9 @@ pub struct EntryMeta {
     pub exit_code: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<i64>,
-    /// `search`-only: FTS5 `snippet()` excerpt with match terms wrapped in
-    /// `‹›` and elided context shown as `…`. Empty/None for list/get.
+    /// `search`-only: the `cmd` text with each fuzzy-matched character
+    /// wrapped in `‹…›` markers (produced by `storage::highlight_indices`
+    /// from nucleo's match indices). `None` for `list`/`get`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snippet: Option<String>,
 }
@@ -83,32 +88,11 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ts_unix_ns: Option<i64>,
     },
-    /// Recent entries, newest first.
-    List {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        limit: Option<usize>,
-        #[serde(default)]
-        filters: Filters,
-    },
-    /// Full-text search across `cmd` via FTS5. `query` is treated as a
-    /// single phrase unless `raw` is set, in which case it's passed to FTS5
-    /// verbatim (so operators like `AND`, `OR`, `NEAR`, `prefix*` work).
-    Search {
-        query: String,
-        #[serde(default)]
-        raw: bool,
-        #[serde(default)]
-        sort: SearchSort,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        limit: Option<usize>,
-        #[serde(default)]
-        filters: Filters,
-    },
-    /// Metadata for one entry.
-    Get { id: i64 },
-    /// Import an existing shell-history file (`.zsh_history` or
-    /// `.bash_history`). Long-running; daemon runs it on a blocking task.
-    Import { path: String, shell: String },
+    /// Import an existing history source — `.zsh_history`, `.bash_history`,
+    /// or atuin's `history.db`. `source` selects the parser:
+    /// `"zsh"` / `"bash"` / `"atuin"`. Long-running; daemon runs it on a
+    /// blocking task.
+    Import { path: String, source: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,7 +100,5 @@ pub enum Request {
 pub enum Response {
     Ok,
     Error { message: String },
-    Entries { entries: Vec<EntryMeta> },
-    Entry { entry: EntryMeta },
     Imported { inserted: usize },
 }

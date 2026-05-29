@@ -2,24 +2,35 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{Local, NaiveDate, NaiveDateTime, TimeZone};
 use clap::{Parser, Subcommand};
+use rusqlite::Connection;
 
 use munin::config;
 use munin::proto::{EntryMeta, Filters, Request, Response, SearchSort};
 use munin::shells::{self, Shell};
-use munin::storage::default_db_path;
-use munin::{current_hostname, default_socket_path, now_unix_ns, tui};
+use munin::storage::{self, default_db_path};
+use munin::tui::Outcome;
+use munin::{current_hostname, default_socket_path, fmt_dur, now_unix_ns, tui};
 
 #[derive(Parser)]
 #[command(name = "munin", version, about = "Query the munin shell-history daemon")]
 struct Cli {
-    /// Override the daemon socket path. Default: $XDG_RUNTIME_DIR/munin.sock
+    /// Override the daemon socket path. Default: $XDG_RUNTIME_DIR/munin.sock.
+    /// Only used by daemon-routed subcommands (ping, add-start, add-end,
+    /// import).
     #[arg(long, value_name = "PATH")]
     socket: Option<PathBuf>,
+
+    /// Override the SQLite database path. Default:
+    /// $XDG_DATA_HOME/munin/munin.db. Only affects read subcommands
+    /// (list, search, get) and the interactive TUI — those open the DB
+    /// directly.
+    #[arg(long, value_name = "PATH")]
+    db: Option<PathBuf>,
 
     #[command(subcommand)]
     cmd: Cmd,
@@ -60,21 +71,18 @@ enum Cmd {
         #[arg(long, default_value_t = 50)]
         limit: usize,
     },
-    /// Full-text search across recorded commands (FTS5). Pass -i to open
-    /// an fzf-style interactive picker instead of a one-shot query.
+    /// Fuzzy search across recorded commands (fzf-style scoring via
+    /// nucleo-matcher). Pass -i to open an interactive picker instead of a
+    /// one-shot query.
     #[command(visible_alias = "s")]
     Search {
-        /// Query terms. Joined with spaces and matched as a single phrase
-        /// unless --raw is given. With -i, used as the initial query.
+        /// Query terms; joined with spaces and matched fuzzily against each
+        /// command. With -i, used as the initial query.
         query: Vec<String>,
         /// Open the interactive TUI seeded with QUERY (if any). Print the
         /// chosen command to stdout on Enter; exit silently on Esc.
         #[arg(short, long)]
         interactive: bool,
-        /// Pass the query through to FTS5 verbatim (enables operators like
-        /// AND, OR, NEAR, prefix*, "exact phrase"). Non-interactive only.
-        #[arg(long)]
-        raw: bool,
         /// Result ordering.
         #[arg(long, value_enum, default_value_t = SearchSort::Relevance)]
         sort: SearchSort,
@@ -86,13 +94,26 @@ enum Cmd {
     /// Show one entry by id.
     #[command(visible_alias = "info")]
     Get { id: i64 },
-    /// Import an existing shell-history file (.zsh_history / .bash_history).
+    /// Import history from a file or another tool's database.
     Import {
-        /// Path to the history file.
-        path: PathBuf,
-        /// Which format to parse it as.
-        #[arg(value_enum)]
-        shell: Shell,
+        #[command(subcommand)]
+        from: ImportFrom,
+    },
+}
+
+#[derive(Subcommand)]
+enum ImportFrom {
+    /// Parse a `.zsh_history` file (extended format or plain).
+    Zsh { path: PathBuf },
+    /// Parse a `.bash_history` file (HISTTIMEFORMAT-aware or plain).
+    Bash { path: PathBuf },
+    /// Copy from an atuin `history.db`. Defaults to
+    /// `~/.local/share/atuin/history.db`. Idempotent — atuin's UUIDv7 ids
+    /// are preserved as munin's `uuid`, so re-imports drop dupes.
+    Atuin {
+        /// Override the path to atuin's history database.
+        #[arg(long, value_name = "PATH")]
+        path: Option<PathBuf>,
     },
 }
 
@@ -152,18 +173,24 @@ fn parse_when(s: &str) -> Result<i64> {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Two subcommands skip the daemon entirely:
+    // Subcommands that don't need the daemon:
     //   - `init` (just prints an embedded script)
-    //   - `search -i` (TUI reads SQLite directly; works when munind is down)
-    match &cli.cmd {
+    //   - `search -i` (interactive TUI, opens SQLite directly)
+    //   - `list` / `search` (non-interactive) / `get` (read straight from
+    //     the DB so the read CLI keeps working when munind is down)
+    match cli.cmd {
         Cmd::Init { shell } => {
-            print!("{}", shells::init_script(*shell));
+            print!("{}", shells::init_script(shell));
             return Ok(());
         }
         Cmd::Search {
             interactive: true, ..
-        } => return run_tui(cli.cmd),
-        _ => {}
+        } => return run_tui(cli.cmd, cli.db.as_deref()),
+        Cmd::List { .. } | Cmd::Search { .. } | Cmd::Get { .. } => {
+            return run_read(cli.cmd, cli.db.as_deref());
+        }
+        // Fall through to the daemon-routed path below.
+        Cmd::Ping | Cmd::AddStart { .. } | Cmd::AddEnd { .. } | Cmd::Import { .. } => {}
     }
 
     let path = cli.socket.unwrap_or_else(default_socket_path);
@@ -214,55 +241,17 @@ fn main() -> Result<()> {
                 },
             )?;
         }
-        Cmd::List { filters, limit } => {
-            let filters = filters.into_proto()?;
-            send(
-                &mut writer,
-                &Request::List {
-                    limit: Some(limit),
-                    filters,
-                },
-            )?;
-            match read_response(&mut reader)? {
-                Response::Entries { entries } => print_table(&entries),
-                Response::Error { message } => return Err(anyhow!("{message}")),
-                other => return Err(unexpected("list", &other)),
-            }
-        }
-        Cmd::Search {
-            query,
-            interactive: _, // handled above
-            raw,
-            sort,
-            filters,
-            limit,
-        } => {
-            let filters = filters.into_proto()?;
-            send(
-                &mut writer,
-                &Request::Search {
-                    query: query.join(" "),
-                    raw,
-                    sort,
-                    limit: Some(limit),
-                    filters,
-                },
-            )?;
-            match read_response(&mut reader)? {
-                Response::Entries { entries } => print_table(&entries),
-                Response::Error { message } => return Err(anyhow!("{message}")),
-                other => return Err(unexpected("search", &other)),
-            }
-        }
-        Cmd::Get { id } => {
-            send(&mut writer, &Request::Get { id })?;
-            match read_response(&mut reader)? {
-                Response::Entry { entry } => print_entry(&entry),
-                Response::Error { message } => return Err(anyhow!("{message}")),
-                other => return Err(unexpected("get", &other)),
-            }
-        }
-        Cmd::Import { path, shell } => {
+        Cmd::Import { from } => {
+            let (path, source) = match from {
+                ImportFrom::Zsh { path } => (path, "zsh"),
+                ImportFrom::Bash { path } => (path, "bash"),
+                ImportFrom::Atuin { path } => {
+                    let p = path
+                        .or_else(default_atuin_db_path)
+                        .ok_or_else(|| anyhow!("can't locate atuin db; pass --path"))?;
+                    (p, "atuin")
+                }
+            };
             let path_str = path
                 .canonicalize()
                 .with_context(|| format!("canonicalize {}", path.display()))?
@@ -272,10 +261,7 @@ fn main() -> Result<()> {
                 &mut writer,
                 &Request::Import {
                     path: path_str,
-                    shell: match shell {
-                        Shell::Zsh => "zsh".into(),
-                        Shell::Bash => "bash".into(),
-                    },
+                    source: source.into(),
                 },
             )?;
             match read_response(&mut reader)? {
@@ -284,35 +270,97 @@ fn main() -> Result<()> {
                 other => return Err(unexpected("import", &other)),
             }
         }
-        Cmd::Init { .. } => unreachable!("handled before connecting"),
+        Cmd::Init { .. } => unreachable!("Init returns at the prefix match"),
+        Cmd::List { .. } | Cmd::Search { .. } | Cmd::Get { .. } => {
+            unreachable!("read commands return from run_read at the prefix match")
+        }
     }
     Ok(())
 }
 
+/// Run a read subcommand (`list`, `search` non-interactive, `get`) directly
+/// against SQLite. The daemon is not consulted — these commands work even
+/// when `munind` is down. WAL mode makes the concurrent read safe.
+fn run_read(cmd: Cmd, db_override: Option<&Path>) -> Result<()> {
+    let db_path = resolve_db_path(db_override)?;
+    let conn = Connection::open(&db_path)
+        .with_context(|| format!("open db {}", db_path.display()))?;
+    match cmd {
+        Cmd::List { filters, limit } => {
+            let filters = filters.into_proto()?;
+            let entries = storage::list(&conn, limit, &filters)?;
+            print_table(&entries);
+        }
+        Cmd::Search {
+            query,
+            interactive: false,
+            sort,
+            filters,
+            limit,
+        } => {
+            let filters = filters.into_proto()?;
+            let entries =
+                storage::search(&conn, &query.join(" "), sort, limit, &filters)?;
+            print_table(&entries);
+        }
+        Cmd::Get { id } => match storage::get(&conn, id)? {
+            Some(entry) => print_entry(&entry),
+            None => return Err(anyhow!("no entry with id {id}")),
+        },
+        _ => unreachable!("run_read called with non-read command"),
+    }
+    Ok(())
+}
+
+fn resolve_db_path(override_path: Option<&Path>) -> Result<PathBuf> {
+    match override_path {
+        Some(p) => Ok(p.to_path_buf()),
+        None => default_db_path(),
+    }
+}
+
 /// Open the fzf-style picker. Talks to SQLite directly (no daemon
-/// dependency); prints the chosen command to stdout on Enter, or nothing
-/// on Esc / Ctrl-C.
-fn run_tui(cmd: Cmd) -> Result<()> {
+/// dependency).
+///
+/// Exit-code contract (consumed by the shell hook in M5):
+/// - `0` + cmd on stdout: Enter — run this command.
+/// - `2` + cmd on stdout: Tab — drop on the line buffer for the user to edit.
+/// - `1` + nothing on stdout: Esc / Ctrl-C — cancel.
+fn run_tui(cmd: Cmd, db_override: Option<&Path>) -> Result<()> {
     let Cmd::Search {
         query,
         filters,
-        // `raw` / `sort` / `limit` are intentionally ignored — the TUI uses
-        // the config file's sort and an interactive `limit` of its own
-        // (config.limit). Phrase escaping is always on in the TUI; users who
-        // want FTS5 operators can fall back to non-interactive `search --raw`.
+        // `sort` / `limit` are intentionally ignored — the TUI uses the
+        // config file's sort and an interactive `limit` of its own
+        // (config.limit).
         ..
     } = cmd
     else {
         unreachable!("run_tui only called for interactive search");
     };
     let cfg = config::load_or_default();
-    let db_path = default_db_path()?;
+    let db_path = resolve_db_path(db_override)?;
     let filters = filters.into_proto()?;
-    let selected = tui::run(&db_path, query.join(" "), filters, &cfg)?;
-    if let Some(cmd) = selected {
-        println!("{cmd}");
+    match tui::run(&db_path, query.join(" "), filters, &cfg)? {
+        Outcome::Run(cmd) => {
+            println!("{cmd}");
+            Ok(())
+        }
+        Outcome::Edit(cmd) => {
+            println!("{cmd}");
+            std::process::exit(2);
+        }
+        Outcome::Cancel => std::process::exit(1),
     }
-    Ok(())
+}
+
+/// Where atuin stores its history by default: `$XDG_DATA_HOME/atuin/history.db`
+/// (falling back to `$HOME/.local/share/atuin/history.db`).
+fn default_atuin_db_path() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))?;
+    Some(base.join("atuin").join("history.db"))
 }
 
 fn send<W: Write>(wr: &mut W, req: &Request) -> Result<()> {
@@ -410,14 +458,3 @@ fn fmt_ts(ns: i64) -> String {
     }
 }
 
-fn fmt_dur(ms: Option<i64>) -> String {
-    let Some(ms) = ms else { return "-".into() };
-    if ms < 1_000 {
-        format!("{ms}ms")
-    } else if ms < 60_000 {
-        format!("{:.1}s", ms as f64 / 1_000.0)
-    } else {
-        let s = ms / 1_000;
-        format!("{}m{:02}s", s / 60, s % 60)
-    }
-}

@@ -46,3 +46,18 @@ pub fn current_hostname() -> Option<String> {
         .map(|s| s.trim().to_owned())
         .filter(|s| !s.is_empty())
 }
+
+/// Human-friendly duration formatter: `Some(ms)` → `"345ms"` / `"3.4s"` /
+/// `"1m23s"`; `None` → `"-"`. Shared by the CLI's `print_table` and the
+/// TUI's row renderer so they stay in sync.
+pub fn fmt_dur(ms: Option<i64>) -> String {
+    let Some(ms) = ms else { return "-".into() };
+    if ms < 1_000 {
+        format!("{ms}ms")
+    } else if ms < 60_000 {
+        format!("{:.1}s", ms as f64 / 1_000.0)
+    } else {
+        let s = ms / 1_000;
+        format!("{}m{:02}s", s / 60, s % 60)
+    }
+}

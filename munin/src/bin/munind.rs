@@ -35,9 +35,8 @@ fn main() -> Result<()> {
 
     runtime.spawn({
         let socket_path = socket_path.clone();
-        let db_path = db_path.clone();
         async move {
-            if let Err(e) = ipc::serve(socket_path, db_path, store_tx).await {
+            if let Err(e) = ipc::serve(socket_path, store_tx).await {
                 warn!(error = %e, "ipc server stopped");
             }
         }

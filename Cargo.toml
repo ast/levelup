@@ -23,6 +23,7 @@ uuid = { version = "1", features = ["v4", "v7"] }
 ratatui = "0.29"
 crossterm = "0.28"
 toml = { version = "0.8", default-features = false, features = ["parse"] }
+nucleo-matcher = "0.3"
 
 [profile.release]
 lto = "thin"
