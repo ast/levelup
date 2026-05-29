@@ -200,12 +200,29 @@ fn run_loop(
     };
     refresh_results(&mut state, conn, cfg)?;
     ensure_preview(&mut state, conn)?;
+    // SQLite bumps `data_version` on every commit by *another* connection, so
+    // it's a cheap way to notice the daemon capturing new entries while we're
+    // open. Seed it now; the idle tick below re-reads and refreshes on change.
+    let mut last_data_version = data_version(conn)?;
 
     loop {
         term.draw(|f| render(f, &mut state, cfg))?;
 
         // 100ms poll lets us pick up window resizes without busy-looping.
         if !event::poll(Duration::from_millis(100))? {
+            // Idle tick: if the daemon committed something (a fresh capture,
+            // or a delete from elsewhere), re-run the current search so the
+            // list stays live. Only while in the normal view — we don't want
+            // the selection shifting under a confirm/MIME-chooser prompt; the
+            // change is picked up when the user returns to Normal.
+            if matches!(state.mode, Mode::Normal) {
+                let v = data_version(conn)?;
+                if v != last_data_version {
+                    last_data_version = v;
+                    refresh_results_preserving(&mut state, conn, cfg)?;
+                    ensure_preview(&mut state, conn)?;
+                }
+            }
             continue;
         }
         let Event::Key(key) = event::read()? else {
@@ -503,7 +520,30 @@ fn delete_back_word(state: &mut State) -> KeyOutcome {
     KeyOutcome::Refresh
 }
 
+/// Re-run the search after the query/sort/selection changed: results reset
+/// and the selection snaps back to the best/newest match.
 fn refresh_results(state: &mut State, conn: &Connection, cfg: &Config) -> Result<()> {
+    refresh_inner(state, conn, cfg, false)
+}
+
+/// Re-run the search after an *external* change (a daemon capture on the idle
+/// tick) where the query is unchanged: keep the user where they were by
+/// re-selecting the same entry id if it's still in the results.
+fn refresh_results_preserving(state: &mut State, conn: &Connection, cfg: &Config) -> Result<()> {
+    refresh_inner(state, conn, cfg, true)
+}
+
+fn refresh_inner(
+    state: &mut State,
+    conn: &Connection,
+    cfg: &Config,
+    preserve_selection: bool,
+) -> Result<()> {
+    let prev_id = if preserve_selection {
+        state.selected_entry().map(|e| e.id)
+    } else {
+        None
+    };
     // `storage::search` handles the empty-query short-circuit (most-recent N).
     let mut results = storage::search(
         conn,
@@ -526,9 +566,22 @@ fn refresh_results(state: &mut State, conn: &Connection, cfg: &Config) -> Result
             Layout::Top => 0,
         })
     };
+    // Prefer the previously-selected entry (preserve case); fall back to the
+    // default position if it's gone or this is a query-driven refresh.
+    let select = prev_id
+        .and_then(|id| state.results.iter().position(|e| e.id == id))
+        .map(Some)
+        .unwrap_or(initial);
     *state.list_state.offset_mut() = 0;
-    state.select(initial);
+    state.select(select);
     Ok(())
+}
+
+/// SQLite's cross-connection change counter. Unchanged for commits made on
+/// *this* connection; bumped when another connection (the daemon) commits —
+/// exactly what we want to detect a fresh capture without scanning the table.
+fn data_version(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row("PRAGMA data_version", [], |r| r.get(0))?)
 }
 
 /// Rebuild the preview cache if the selected entry changed.
