@@ -17,9 +17,8 @@ pub struct EntryMeta {
     pub size_bytes: i64,
     /// Short text excerpt of the entry. For `list` / `get` responses this
     /// is the leading 200 chars of the indexable text (or `None` for
-    /// image-only entries). For `search` responses it's an FTS5
-    /// `snippet()` excerpt with match terms wrapped in `‹›` and elided
-    /// context shown as `…`.
+    /// image-only entries). For `search` responses it's the matched text
+    /// with the nucleo-matched chars wrapped in `‹›`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snippet: Option<String>,
 }
@@ -46,18 +45,23 @@ pub enum Request {
         mime: Option<String>,
     },
     /// Make an old entry the current clipboard selection again. The daemon
-    /// becomes the data source until another app takes the selection.
+    /// becomes the data source until another app takes the selection. When
+    /// `mime` is `Some`, only that MIME is served (used by the interactive
+    /// picker's MIME chooser); `None` serves every MIME the entry carries.
     Copy {
         id: i64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         selection: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mime: Option<String>,
     },
-    /// Full-text search across indexed entries. `query` is treated as a
-    /// single phrase unless `raw` is true (then it's passed to FTS5 as-is).
+    /// Delete an entry from history. `mime_parts` cascade on the foreign key;
+    /// the row is gone for good (no undo). Used by the picker's Ctrl-X.
+    Delete { id: i64 },
+    /// Fuzzy search across stored entries (fzf-style scoring via
+    /// nucleo-matcher). Empty/whitespace queries fall through to most-recent.
     Search {
         query: String,
-        #[serde(default)]
-        raw: bool,
         #[serde(default)]
         sort: SearchSort,
         #[serde(default, skip_serializing_if = "Option::is_none")]

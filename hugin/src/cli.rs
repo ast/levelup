@@ -5,7 +5,7 @@ use clap::Parser;
 use clap_complete::Shell;
 
 use crate::default_socket_path;
-use crate::storage::{default_db_path, RetentionConfig};
+use crate::storage::{RetentionConfig, default_db_path};
 
 #[derive(Debug, Parser)]
 #[command(name = "hugind", version, about = "Wayland clipboard manager daemon")]

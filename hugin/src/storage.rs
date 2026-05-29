@@ -13,7 +13,11 @@ use crate::{CapturedEntry, is_text_mime};
 
 /// Schema version stored in `PRAGMA user_version`. Bump when the on-disk
 /// shape changes incompatibly; `Store::open` refuses to start on mismatch.
-const DB_VERSION: i32 = 2;
+/// v1 = entries (+ inline `text` column) + mime_parts. (FTS5 was tried at v2
+/// and removed once search moved to in-process nucleo fuzzy matching — same
+/// trajectory as munin. Dev-stage, so the rollback ships with no migration:
+/// the on-disk v2 DB is refused and the user deletes it.)
+const DB_VERSION: i32 = 1;
 
 const SCHEMA_SQL: &str = "
 CREATE TABLE IF NOT EXISTS entries (
@@ -21,7 +25,8 @@ CREATE TABLE IF NOT EXISTS entries (
     ts_unix_ns  INTEGER NOT NULL,
     selection   TEXT NOT NULL,
     hash        BLOB NOT NULL,
-    size_bytes  INTEGER NOT NULL
+    size_bytes  INTEGER NOT NULL,
+    text        TEXT
 );
 CREATE INDEX IF NOT EXISTS entries_hash_idx ON entries(hash);
 CREATE INDEX IF NOT EXISTS entries_ts_idx ON entries(ts_unix_ns);
@@ -33,12 +38,6 @@ CREATE TABLE IF NOT EXISTS mime_parts (
     blob        BLOB NOT NULL,
     PRIMARY KEY (entry_id, mime)
 );
-
-CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(content);
-
-CREATE TRIGGER IF NOT EXISTS entries_ad AFTER DELETE ON entries BEGIN
-    DELETE FROM entries_fts WHERE rowid = OLD.id;
-END;
 ";
 
 /// Upper bound on `limit` for list/search queries. Caps the result set so
@@ -46,41 +45,39 @@ END;
 /// in particular guards against `usize::MAX as i64 == -1`, which SQLite
 /// would otherwise interpret as "no limit". Matches the default retention
 /// cap so a fully-populated DB is still listable.
-const MAX_LIMIT: usize = 10_000;
+pub const MAX_LIMIT: usize = 10_000;
 
-// SQL strings are static so list/get/search don't rebuild them per call.
-// The `200` is the leading-substr snippet width for list/get; the
-// `‹›/…/16` arguments to `snippet()` are the FTS5 highlight markers and
-// token-count budget. Keep both in step if you tune one.
+/// How much of an entry's indexable `text` we feed to nucleo as a match
+/// haystack (and from which we build the highlighted snippet). Clipboard
+/// payloads can be megabytes; fuzzy-scoring the whole thing across the
+/// candidate pool on every keystroke would be wasteful, and the
+/// distinguishing tokens of a clipping are almost always near the front.
+const MATCH_PREFIX: usize = 4096;
+
+// SQL strings are static so list/get/search don't rebuild them per call. The
+// `200` is the leading-substr snippet width for list/get; search reads the
+// full (prefix-capped in Rust) `text` so nucleo can match deeper than the
+// 200-char preview.
 
 const LIST_SQL: &str = "\
-    SELECT e.id, e.ts_unix_ns, e.selection, e.size_bytes, \
-           substr(f.content, 1, 200) \
-    FROM entries e LEFT JOIN entries_fts f ON f.rowid = e.id \
-    WHERE (?1 IS NULL OR e.selection = ?1) \
-    ORDER BY e.id DESC LIMIT ?2";
+    SELECT id, ts_unix_ns, selection, size_bytes, substr(text, 1, 200) \
+    FROM entries \
+    WHERE (?1 IS NULL OR selection = ?1) \
+    ORDER BY id DESC LIMIT ?2";
 
 const GET_SQL: &str = "\
-    SELECT e.id, e.ts_unix_ns, e.selection, e.size_bytes, \
-           substr(f.content, 1, 200) \
-    FROM entries e LEFT JOIN entries_fts f ON f.rowid = e.id \
-    WHERE e.id = ?1";
+    SELECT id, ts_unix_ns, selection, size_bytes, substr(text, 1, 200) \
+    FROM entries WHERE id = ?1";
 
-const SEARCH_SQL_RELEVANCE: &str = "\
-    SELECT e.id, e.ts_unix_ns, e.selection, e.size_bytes, \
-           snippet(entries_fts, 0, '‹', '›', '…', 16) \
-    FROM entries_fts \
-    JOIN entries e ON e.id = entries_fts.rowid \
-    WHERE entries_fts MATCH ?1 AND (?2 IS NULL OR e.selection = ?2) \
-    ORDER BY bm25(entries_fts) ASC, e.id DESC LIMIT ?3";
-
-const SEARCH_SQL_RECENT: &str = "\
-    SELECT e.id, e.ts_unix_ns, e.selection, e.size_bytes, \
-           snippet(entries_fts, 0, '‹', '›', '…', 16) \
-    FROM entries_fts \
-    JOIN entries e ON e.id = entries_fts.rowid \
-    WHERE entries_fts MATCH ?1 AND (?2 IS NULL OR e.selection = ?2) \
-    ORDER BY e.id DESC LIMIT ?3";
+/// Candidate pool for fuzzy search: recent rows with their full indexable
+/// text (capped in Rust to `MATCH_PREFIX`). Filtered by selection at the SQL
+/// layer; bounded by `MAX_LIMIT` so a huge DB can't blow up the in-memory
+/// pool.
+const SEARCH_POOL_SQL: &str = "\
+    SELECT id, ts_unix_ns, selection, size_bytes, text \
+    FROM entries \
+    WHERE (?1 IS NULL OR selection = ?1) \
+    ORDER BY id DESC LIMIT ?2";
 
 #[derive(Debug, Clone)]
 pub struct RetentionConfig {
@@ -153,13 +150,14 @@ impl Store {
         let indexable = pick_indexable_text(&entry.parts);
         let tx = self.conn.transaction()?;
         tx.execute(
-            "INSERT INTO entries (ts_unix_ns, selection, hash, size_bytes)
-             VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO entries (ts_unix_ns, selection, hash, size_bytes, text)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 entry.ts_unix_ns,
                 entry.selection.as_str(),
                 hash.as_bytes(),
                 total_size,
+                indexable,
             ],
         )?;
         let id = tx.last_insert_rowid();
@@ -169,12 +167,6 @@ impl Store {
             for (mime, blob) in &entry.parts {
                 stmt.execute(params![id, mime, blob])?;
             }
-        }
-        if let Some(text) = indexable {
-            tx.execute(
-                "INSERT INTO entries_fts (rowid, content) VALUES (?1, ?2)",
-                params![id, text],
-            )?;
         }
         tx.commit()?;
         Ok(Some(id))
@@ -204,22 +196,14 @@ impl Store {
 }
 
 /// Refuse to open a database produced by a different schema generation.
-/// Fresh DBs (no `entries` table yet) pass through; otherwise the
-/// `user_version` pragma must match `DB_VERSION` *and* the FTS virtual table
-/// must be present. Pre-FTS DBs predate the versioning scheme and sit at
-/// `user_version = 0` even though their schema is incompatible — we detect
-/// them by the presence of `entries`.
+/// Fresh DBs (no `entries` table yet) pass through unconditionally; anything
+/// else must match `DB_VERSION`. Pre-versioning DBs sit at `user_version = 0`
+/// with an `entries` table and the brief FTS build stamped `user_version = 2`
+/// — both are refused here so the user deletes the file (no migration; this
+/// is dev-stage). Same discipline as `munin/src/storage.rs`.
 fn ensure_compatible_schema(conn: &Connection, path: &Path) -> Result<()> {
     let version: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if version == DB_VERSION {
-        if !table_exists(conn, "entries_fts")? {
-            bail!(
-                "hugin database at {} is at schema v{version} but entries_fts is missing; \
-                 the search index has been dropped out-of-band. Delete the file and restart \
-                 to recreate (or rebuild entries_fts manually if you need to keep the data).",
-                path.display(),
-            );
-        }
         return Ok(());
     }
     if version == 0 && !table_exists(conn, "entries")? {
@@ -339,39 +323,150 @@ pub fn list(conn: &Connection, limit: usize, selection: Option<&str>) -> Result<
     attach_mimes(conn, rows)
 }
 
-/// Full-text search of indexed clipboard entries. `query` is treated as a
-/// single phrase unless `raw` is set, in which case it's passed through to
-/// FTS5 verbatim. `selection` filters by `"regular"` / `"primary"`. The
-/// snippet field contains `snippet(...)` excerpts with match terms wrapped
-/// in `‹›` and elided context shown as `…`. Empty/whitespace queries
-/// short-circuit to an empty result; `limit` is clamped to `MAX_LIMIT`.
+/// Fuzzy search over the recent-entries pool using nucleo-matcher
+/// (fzf-style subsequence scoring — the same matcher munin uses).
+///
+/// Empty / whitespace-only queries fall through to `list` (most-recent N, no
+/// scoring, no snippets). Non-empty queries pull up to `MAX_LIMIT` candidates
+/// via `SEARCH_POOL_SQL` and score each entry's `text` (capped to
+/// `MATCH_PREFIX` chars) with nucleo; non-matches and text-less entries
+/// (images / binary) are dropped. The snippet is built from the matched
+/// codepoint indices with matched chars wrapped in `‹…›`, the same markers
+/// the CLI table and the TUI renderer understand. `limit` is clamped to
+/// `MAX_LIMIT`.
 pub fn search(
     conn: &Connection,
     query: &str,
-    raw: bool,
     sort: SearchSort,
     limit: usize,
     selection: Option<&str>,
 ) -> Result<Vec<EntryMeta>> {
-    if query.trim().is_empty() {
-        return Ok(Vec::new());
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return list(conn, limit, selection);
     }
-    let match_expr = if raw {
-        query.to_owned()
-    } else {
-        // FTS5 phrase literal: wrap in double quotes, doubling embedded ones.
-        format!("\"{}\"", query.replace('"', "\"\""))
-    };
-    let limit = limit.min(MAX_LIMIT) as i64;
-    let sql = match sort {
-        SearchSort::Relevance => SEARCH_SQL_RELEVANCE,
-        SearchSort::Recent => SEARCH_SQL_RECENT,
-    };
-    let mut stmt = conn.prepare(sql)?;
-    let rows: Vec<RowTuple> = stmt
-        .query_map(params![&match_expr, selection, limit], row_to_tuple)?
+
+    // Pull the candidate pool with full text (capped per row below). Filters
+    // apply at SQL; the pool is bounded by MAX_LIMIT.
+    let mut stmt = conn.prepare(SEARCH_POOL_SQL)?;
+    let pool: Vec<(RowTuple, Option<String>)> = stmt
+        .query_map(params![selection, MAX_LIMIT as i64], |row| {
+            let text: Option<String> = row.get(4)?;
+            Ok((
+                (
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    // snippet is rebuilt below from match indices; seed None.
+                    None,
+                ),
+                text,
+            ))
+        })?
         .collect::<rusqlite::Result<_>>()?;
+    drop(stmt);
+
+    let mut matcher = nucleo_matcher::Matcher::new(nucleo_matcher::Config::DEFAULT);
+    let pattern = nucleo_matcher::pattern::Pattern::parse(
+        trimmed,
+        nucleo_matcher::pattern::CaseMatching::Smart,
+        nucleo_matcher::pattern::Normalization::Smart,
+    );
+
+    let mut hay_buf = Vec::new();
+    let mut idx_buf = Vec::new();
+    let mut scored: Vec<(u32, RowTuple)> = Vec::with_capacity(pool.len());
+    for (mut row, text) in pool {
+        let Some(text) = text else { continue };
+        // Cap the haystack: distinguishing tokens of a clipping live up front,
+        // and unbounded blobs would make per-keystroke scoring expensive.
+        let hay = prefix_chars(&text, MATCH_PREFIX);
+        idx_buf.clear();
+        let haystack = nucleo_matcher::Utf32Str::new(hay, &mut hay_buf);
+        if let Some(score) = pattern.indices(haystack, &mut matcher, &mut idx_buf) {
+            // nucleo doesn't guarantee sorted indices; sort before walking.
+            idx_buf.sort_unstable();
+            row.4 = Some(highlight_indices(hay, &idx_buf));
+            scored.push((score, row));
+        }
+    }
+
+    match sort {
+        SearchSort::Relevance => {
+            // Score desc, tiebreak by id desc (newer first).
+            scored.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.0.cmp(&a.1.0)));
+        }
+        SearchSort::Recent => {
+            scored.sort_by_key(|s| std::cmp::Reverse(s.1.0));
+        }
+    }
+
+    let limit = limit.min(MAX_LIMIT);
+    let rows: Vec<RowTuple> = scored.into_iter().take(limit).map(|(_, r)| r).collect();
     attach_mimes(conn, rows)
+}
+
+/// Borrow the leading `max_chars` codepoints of `s` without allocating,
+/// snapping to a char boundary (never splits a multi-byte char).
+fn prefix_chars(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((byte_idx, _)) => &s[..byte_idx],
+        None => s,
+    }
+}
+
+/// Walk `s` codepoint by codepoint; wrap runs of matched positions
+/// (`indices`, sorted ascending) in `‹…›`. The CLI table and the TUI's
+/// `highlight_snippet` parse these markers to colour the matched runs.
+fn highlight_indices(s: &str, indices: &[u32]) -> String {
+    let mut out = String::with_capacity(s.len() + indices.len() * 4);
+    let mut idx_iter = indices.iter().copied().peekable();
+    let mut in_match = false;
+    for (i, c) in s.chars().enumerate() {
+        let is_match = idx_iter.peek() == Some(&(i as u32));
+        if is_match {
+            if !in_match {
+                out.push('‹');
+                in_match = true;
+            }
+            out.push(c);
+            idx_iter.next();
+        } else {
+            if in_match {
+                out.push('›');
+                in_match = false;
+            }
+            out.push(c);
+        }
+    }
+    if in_match {
+        out.push('›');
+    }
+    out
+}
+
+/// Delete an entry (and its `mime_parts`, via the FK cascade). Returns
+/// `true` if a row was removed. Foreign keys must be ON for the cascade —
+/// callers open the connection with `PRAGMA foreign_keys = ON`.
+pub fn delete(conn: &Connection, id: i64) -> Result<bool> {
+    let n = conn.execute("DELETE FROM entries WHERE id = ?1", params![id])?;
+    Ok(n > 0)
+}
+
+/// Leading text of an entry for the picker's preview pane: up to
+/// `max_chars` codepoints of the indexable `text`, or `None` for entries
+/// with no text payload (images / binary — the caller renders metadata).
+pub fn preview_text(conn: &Connection, id: i64, max_chars: usize) -> Result<Option<String>> {
+    let text: Option<String> = conn
+        .query_row(
+            "SELECT substr(text, 1, ?2) FROM entries WHERE id = ?1",
+            params![id, max_chars as i64],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(text)
 }
 
 /// Tuple shape returned by row_to_tuple — (id, ts_unix_ns, selection, size_bytes, snippet).
@@ -405,20 +500,24 @@ fn attach_mimes(conn: &Connection, rows: Vec<RowTuple>) -> Result<Vec<EntryMeta>
     }
     Ok(rows
         .into_iter()
-        .map(|(id, ts_unix_ns, selection, size_bytes, snippet)| EntryMeta {
-            id,
-            ts_unix_ns,
-            selection,
-            mimes: mimes_by_id.remove(&id).unwrap_or_default(),
-            size_bytes,
-            snippet,
-        })
+        .map(
+            |(id, ts_unix_ns, selection, size_bytes, snippet)| EntryMeta {
+                id,
+                ts_unix_ns,
+                selection,
+                mimes: mimes_by_id.remove(&id).unwrap_or_default(),
+                size_bytes,
+                snippet,
+            },
+        )
         .collect())
 }
 
 /// Metadata for a single entry by id, or `None` if not found.
 pub fn get(conn: &Connection, id: i64) -> Result<Option<EntryMeta>> {
-    let row = conn.query_row(GET_SQL, params![id], row_to_tuple).optional()?;
+    let row = conn
+        .query_row(GET_SQL, params![id], row_to_tuple)
+        .optional()?;
     let Some(tuple) = row else {
         return Ok(None);
     };
@@ -436,9 +535,8 @@ pub fn read_blob(
     let chosen = match mime {
         Some(m) => m.to_string(),
         None => {
-            let mut stmt = conn.prepare(
-                "SELECT mime FROM mime_parts WHERE entry_id = ?1 ORDER BY mime",
-            )?;
+            let mut stmt =
+                conn.prepare("SELECT mime FROM mime_parts WHERE entry_id = ?1 ORDER BY mime")?;
             let mimes: Vec<String> = stmt
                 .query_map(params![id], |row| row.get::<_, String>(0))?
                 .collect::<rusqlite::Result<_>>()?;
@@ -509,4 +607,107 @@ pub fn spawn_storage_thread(
         .name("hugin-storage".into())
         .spawn(move || run_storage_thread(store, rx, cfg))
         .context("spawn storage thread")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Apply the live schema to an in-memory DB and insert a couple of
+    /// entries directly (mirroring `Store::insert`) so we can exercise the
+    /// read/search/delete API without the wayland-bound daemon.
+    fn seeded_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute_batch(SCHEMA_SQL).unwrap();
+        // id 1: a text entry.
+        conn.execute(
+            "INSERT INTO entries (id, ts_unix_ns, selection, hash, size_bytes, text)
+             VALUES (1, 100, 'regular', x'00', 11, 'git commit -m')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO mime_parts (entry_id, mime, blob) VALUES (1, 'text/plain', x'00')",
+            [],
+        )
+        .unwrap();
+        // id 2: an image entry (no indexable text).
+        conn.execute(
+            "INSERT INTO entries (id, ts_unix_ns, selection, hash, size_bytes, text)
+             VALUES (2, 200, 'regular', x'01', 34000, NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO mime_parts (entry_id, mime, blob) VALUES (2, 'image/png', x'89504e47')",
+            [],
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn list_newest_first_with_snippet() {
+        let conn = seeded_conn();
+        let rows = list(&conn, 50, None).unwrap();
+        assert_eq!(rows.iter().map(|e| e.id).collect::<Vec<_>>(), vec![2, 1]);
+        // image entry has no text → no snippet; text entry has its substr.
+        assert_eq!(rows[0].snippet, None);
+        assert_eq!(rows[0].mimes, vec!["image/png"]);
+        assert_eq!(rows[1].snippet.as_deref(), Some("git commit -m"));
+    }
+
+    #[test]
+    fn search_fuzzy_matches_and_highlights() {
+        let conn = seeded_conn();
+        // fzf-style subsequence: "gcm" hits "git commit -m".
+        let rows = search(&conn, "gcm", SearchSort::Relevance, 50, None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, 1);
+        let snippet = rows[0].snippet.as_deref().unwrap();
+        assert!(
+            snippet.contains('‹') && snippet.contains('›'),
+            "got {snippet:?}"
+        );
+        // The image entry (no text) never matches a non-empty query.
+        assert!(
+            search(&conn, "png", SearchSort::Relevance, 50, None)
+                .unwrap()
+                .iter()
+                .all(|e| e.id != 2)
+        );
+    }
+
+    #[test]
+    fn search_empty_query_falls_through_to_list() {
+        let conn = seeded_conn();
+        let rows = search(&conn, "   ", SearchSort::Relevance, 50, None).unwrap();
+        assert_eq!(rows.iter().map(|e| e.id).collect::<Vec<_>>(), vec![2, 1]);
+    }
+
+    #[test]
+    fn delete_cascades_to_mime_parts() {
+        let conn = seeded_conn();
+        assert!(delete(&conn, 1).unwrap());
+        assert!(!delete(&conn, 1).unwrap()); // already gone
+        let parts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM mime_parts WHERE entry_id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(parts, 0, "FK cascade should remove orphaned mime_parts");
+    }
+
+    #[test]
+    fn preview_text_returns_text_or_none() {
+        let conn = seeded_conn();
+        assert_eq!(
+            preview_text(&conn, 1, 100).unwrap().as_deref(),
+            Some("git commit -m")
+        );
+        assert_eq!(preview_text(&conn, 2, 100).unwrap(), None); // image: NULL text
+    }
 }

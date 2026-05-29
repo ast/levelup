@@ -17,7 +17,11 @@ use munin::tui::Outcome;
 use munin::{current_hostname, default_socket_path, fmt_dur, now_unix_ns, tui};
 
 #[derive(Parser)]
-#[command(name = "munin", version, about = "Query the munin shell-history daemon")]
+#[command(
+    name = "munin",
+    version,
+    about = "Query the munin shell-history daemon"
+)]
 struct Cli {
     /// Override the daemon socket path. Default: $XDG_RUNTIME_DIR/munin.sock.
     /// Only used by daemon-routed subcommands (ping, add-start, add-end,
@@ -283,8 +287,8 @@ fn main() -> Result<()> {
 /// when `munind` is down. WAL mode makes the concurrent read safe.
 fn run_read(cmd: Cmd, db_override: Option<&Path>) -> Result<()> {
     let db_path = resolve_db_path(db_override)?;
-    let conn = Connection::open(&db_path)
-        .with_context(|| format!("open db {}", db_path.display()))?;
+    let conn =
+        Connection::open(&db_path).with_context(|| format!("open db {}", db_path.display()))?;
     match cmd {
         Cmd::List { filters, limit } => {
             let filters = filters.into_proto()?;
@@ -299,8 +303,7 @@ fn run_read(cmd: Cmd, db_override: Option<&Path>) -> Result<()> {
             limit,
         } => {
             let filters = filters.into_proto()?;
-            let entries =
-                storage::search(&conn, &query.join(" "), sort, limit, &filters)?;
+            let entries = storage::search(&conn, &query.join(" "), sort, limit, &filters)?;
             print_table(&entries);
         }
         Cmd::Get { id } => match storage::get(&conn, id)? {
@@ -457,4 +460,3 @@ fn fmt_ts(ns: i64) -> String {
         None => format!("@{secs}"),
     }
 }
-

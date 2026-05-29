@@ -135,9 +135,15 @@ journalctl --user -u munind -f  # follow the systemd unit
 
 ## hugin
 
-Wayland clipboard manager for sway / hyprland / river (anything supporting `wlr-data-control-unstable-v1`). Persists every selection change to SQLite with dedup and retention.
+Wayland clipboard manager for sway / hyprland / river (anything supporting `wlr-data-control-unstable-v1`). Persists every selection change to SQLite with dedup and retention. Fuzzy search (nucleo-matcher) over clipboard history, plus an fzf-style interactive picker:
 
-Not covered in detail here — see `dist/hugind.service` and `cargo run --bin hugind -p hugin --help` for the rough shape. Status: working, separate scope from munin.
+```sh
+hugin search gcm                # fuzzy: matches a "git commit -m …" clipping
+hugin search -i                 # interactive picker (Enter copies, Tab → stdout,
+                                #   Ctrl-O picks a MIME, Ctrl-X deletes)
+```
+
+The picker reads SQLite directly (works with `hugind` down); copy/delete round-trip to the daemon. Config at `$XDG_CONFIG_HOME/hugin/config.toml` (same shape as munin's, plus a `preview` toggle). Otherwise not covered in detail here — see `dist/hugind.service` and `cargo run --bin hugind -p hugin --help`.
 
 ---
 

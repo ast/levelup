@@ -64,10 +64,7 @@ fn bind_clean(path: &Path) -> Result<()> {
         return Ok(());
     }
     match std::os::unix::net::UnixStream::connect(path) {
-        Ok(_) => anyhow::bail!(
-            "another munind appears to be running at {}",
-            path.display()
-        ),
+        Ok(_) => anyhow::bail!("another munind appears to be running at {}", path.display()),
         Err(_) => std::fs::remove_file(path)
             .with_context(|| format!("remove stale socket {}", path.display())),
     }
@@ -169,9 +166,7 @@ async fn dispatch<W: AsyncWriteExt + Unpin>(
                 return write_error(wr, "storage thread unavailable".into()).await;
             }
             match reply_rx.await {
-                Ok(Ok(inserted)) => {
-                    write_response(wr, &Response::Imported { inserted }).await
-                }
+                Ok(Ok(inserted)) => write_response(wr, &Response::Imported { inserted }).await,
                 Ok(Err(e)) => write_error(wr, e.to_string()).await,
                 Err(_) => write_error(wr, "no reply from storage thread".into()).await,
             }
@@ -190,4 +185,3 @@ async fn write_response<W: AsyncWriteExt + Unpin>(wr: &mut W, resp: &Response) -
 async fn write_error<W: AsyncWriteExt + Unpin>(wr: &mut W, message: String) -> Result<()> {
     write_response(wr, &Response::Error { message }).await
 }
-

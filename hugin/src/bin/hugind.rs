@@ -1,16 +1,16 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{Arc, mpsc};
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser};
 use sd_notify::NotifyState;
-use tokio::signal::unix::{signal, SignalKind};
+use tokio::signal::unix::{SignalKind, signal};
 use tracing::{info, warn};
 
 use hugin::cli::DaemonArgs;
 use hugin::storage::{Store, spawn_storage_thread};
 use hugin::wayland::WaylandCmd;
-use hugin::{init_tracing, ipc, wayland, CapturedEntry};
+use hugin::{CapturedEntry, init_tracing, ipc, wayland};
 
 fn main() -> Result<()> {
     let args = DaemonArgs::parse();

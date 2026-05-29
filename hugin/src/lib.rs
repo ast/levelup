@@ -1,12 +1,16 @@
 pub mod cli;
+pub mod client;
+pub mod config;
 pub mod ipc;
 pub mod proto;
 pub mod storage;
+pub mod tui;
 pub mod wayland;
 
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use chrono::{Local, TimeZone};
 use tracing_subscriber::EnvFilter;
 
 /// Default unix-socket path for daemon ↔ CLI IPC: `$XDG_RUNTIME_DIR/hugin.sock`
@@ -68,4 +72,27 @@ impl CapturedEntry {
 
 pub fn is_text_mime(mime: &str) -> bool {
     mime.starts_with("text/") || mime == "UTF8_STRING" || mime == "STRING" || mime == "TEXT"
+}
+
+/// Format a nanosecond unix timestamp as local `YYYY-MM-DD HH:MM:SS`.
+/// Shared by the CLI table and the interactive picker.
+pub fn fmt_ts(ns: i64) -> String {
+    let secs = ns / 1_000_000_000;
+    match Local.timestamp_opt(secs, 0).single() {
+        Some(dt) => dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+        None => format!("@{secs}"),
+    }
+}
+
+/// Human-readable byte size (`512B` / `1.5K` / `3.2M`).
+pub fn human_size(n: i64) -> String {
+    const KB: i64 = 1024;
+    const MB: i64 = KB * 1024;
+    if n >= MB {
+        format!("{:.1}M", n as f64 / MB as f64)
+    } else if n >= KB {
+        format!("{:.1}K", n as f64 / KB as f64)
+    } else {
+        format!("{n}B")
+    }
 }

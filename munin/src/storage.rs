@@ -446,10 +446,7 @@ pub fn run_storage_thread(mut store: Store, rx: mpsc::Receiver<StoreCmd>) {
 /// Spawn the storage worker on a named thread. The store must already be
 /// opened by the caller so any schema-version error fails fast on the main
 /// thread before the daemon advertises itself as ready.
-pub fn spawn_storage_thread(
-    store: Store,
-    rx: mpsc::Receiver<StoreCmd>,
-) -> Result<JoinHandle<()>> {
+pub fn spawn_storage_thread(store: Store, rx: mpsc::Receiver<StoreCmd>) -> Result<JoinHandle<()>> {
     thread::Builder::new()
         .name("munin-storage".into())
         .spawn(move || run_storage_thread(store, rx))
@@ -685,7 +682,10 @@ fn parse_bash_history(path: &Path) -> Result<Vec<ParsedEntry>> {
         if line.is_empty() {
             continue;
         }
-        if let Some(ts) = line.strip_prefix('#').and_then(|s| s.trim().parse::<i64>().ok()) {
+        if let Some(ts) = line
+            .strip_prefix('#')
+            .and_then(|s| s.trim().parse::<i64>().ok())
+        {
             pending_ts = Some(ts.saturating_mul(1_000_000_000));
             continue;
         }
@@ -719,4 +719,3 @@ fn push_or_continue(
         });
     }
 }
-

@@ -6,15 +6,15 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::os::fd::AsFd;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{Arc, mpsc};
 
 use anyhow::{Context, Result};
 use nix::fcntl::OFlag;
-use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::unistd::pipe2;
 use tokio::sync::oneshot;
 use tracing::{debug, info, warn};
-use wayland_client::globals::{registry_queue_init, GlobalListContents};
+use wayland_client::globals::{GlobalListContents, registry_queue_init};
 use wayland_client::protocol::{wl_registry, wl_seat::WlSeat};
 use wayland_client::{Connection, Dispatch, QueueHandle};
 use wayland_protocols_wlr::data_control::v1::client::{
@@ -173,16 +173,16 @@ impl State {
             },
         );
         conn.flush().context("flush after set_selection")?;
-        info!(sel = sel.as_str(), mimes = mime_count, "became clipboard owner");
+        info!(
+            sel = sel.as_str(),
+            mimes = mime_count,
+            "became clipboard owner"
+        );
         Ok(())
     }
 }
 
-fn read_offer(
-    offer: &ZwlrDataControlOfferV1,
-    mime: &str,
-    conn: &Connection,
-) -> Result<Vec<u8>> {
+fn read_offer(offer: &ZwlrDataControlOfferV1, mime: &str, conn: &Connection) -> Result<Vec<u8>> {
     let (read_fd, write_fd) = pipe2(OFlag::O_CLOEXEC).context("pipe2")?;
     offer.receive(mime.to_string(), write_fd.as_fd());
     drop(write_fd);
@@ -254,7 +254,11 @@ impl Dispatch<ZwlrDataControlOfferV1, ()> for State {
         _qh: &QueueHandle<Self>,
     ) {
         if let zwlr_data_control_offer_v1::Event::Offer { mime_type } = event {
-            state.offers.entry(offer.clone()).or_default().push(mime_type);
+            state
+                .offers
+                .entry(offer.clone())
+                .or_default()
+                .push(mime_type);
         }
     }
 }

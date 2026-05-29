@@ -57,8 +57,8 @@ pub fn run(
     filters: Filters,
     cfg: &Config,
 ) -> Result<Outcome> {
-    let conn = Connection::open(db_path)
-        .with_context(|| format!("open db {}", db_path.display()))?;
+    let conn =
+        Connection::open(db_path).with_context(|| format!("open db {}", db_path.display()))?;
 
     let mut term = setup_terminal()?;
     let result = run_loop(&mut term, &conn, initial_query, filters, cfg);
@@ -269,11 +269,17 @@ fn handle_key(key: KeyEvent, state: &mut State) -> KeyOutcome {
 // ---- editing helpers ------------------------------------------------------
 
 fn prev_char_offset(s: &str, pos: usize) -> usize {
-    s[..pos].chars().next_back().map_or(0, |c| pos - c.len_utf8())
+    s[..pos]
+        .chars()
+        .next_back()
+        .map_or(0, |c| pos - c.len_utf8())
 }
 
 fn next_char_offset(s: &str, pos: usize) -> usize {
-    s[pos..].chars().next().map_or(s.len(), |c| pos + c.len_utf8())
+    s[pos..]
+        .chars()
+        .next()
+        .map_or(s.len(), |c| pos + c.len_utf8())
 }
 
 fn move_cursor_back(state: &mut State) -> KeyOutcome {
@@ -396,12 +402,7 @@ fn render(f: &mut ratatui::Frame<'_>, state: &mut State, cfg: &Config) {
     render_prompt(f, state, cfg, prompt_area);
 }
 
-fn render_list(
-    f: &mut ratatui::Frame<'_>,
-    state: &mut State,
-    cfg: &Config,
-    area: Rect,
-) {
+fn render_list(f: &mut ratatui::Frame<'_>, state: &mut State, cfg: &Config, area: Rect) {
     let match_fg = cfg.colors.match_fg.to_ratatui();
     let items: Vec<ListItem> = state
         .results
@@ -445,9 +446,7 @@ fn render_row(entry: &EntryMeta, match_fg: ratatui::style::Color) -> Line<'stati
         .map(|c| format!("{c:>3}"))
         .unwrap_or_else(|| "  -".into());
     let dur = fmt_dur(entry.duration_ms);
-    let mut spans = vec![
-        Span::raw(format!("{exit}  {dur:>6}  ")),
-    ];
+    let mut spans = vec![Span::raw(format!("{exit}  {dur:>6}  "))];
     // Search results carry a snippet with `‹›` markers. Walk the snippet and
     // colour the matched runs. List/get results (no snippet) just show cmd.
     if let Some(snippet) = entry.snippet.as_deref() {
@@ -496,12 +495,7 @@ fn highlight_snippet(s: &str, match_fg: ratatui::style::Color) -> Vec<Span<'stat
     spans
 }
 
-fn render_status(
-    f: &mut ratatui::Frame<'_>,
-    state: &State,
-    cfg: &Config,
-    area: Rect,
-) {
+fn render_status(f: &mut ratatui::Frame<'_>, state: &State, cfg: &Config, area: Rect) {
     let sort = match state.sort {
         SearchSort::Relevance => "relevance",
         SearchSort::Recent => "recent",
@@ -511,17 +505,11 @@ fn render_status(
         n = state.results.len(),
         plural = if state.results.len() == 1 { "" } else { "es" },
     );
-    let p = Paragraph::new(text)
-        .style(Style::default().fg(cfg.colors.status_fg.to_ratatui()));
+    let p = Paragraph::new(text).style(Style::default().fg(cfg.colors.status_fg.to_ratatui()));
     f.render_widget(p, area);
 }
 
-fn render_prompt(
-    f: &mut ratatui::Frame<'_>,
-    state: &State,
-    cfg: &Config,
-    area: Rect,
-) {
+fn render_prompt(f: &mut ratatui::Frame<'_>, state: &State, cfg: &Config, area: Rect) {
     let line = Line::from(vec![
         Span::styled(
             "› ",
@@ -546,8 +534,7 @@ fn render_prompt(
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode().context("enable raw mode")?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
-        .context("enter alternate screen")?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture).context("enter alternate screen")?;
     let backend = CrosstermBackend::new(stdout);
     Terminal::new(backend).context("create terminal")
 }

@@ -21,11 +21,7 @@ use crate::{Selection, storage};
 /// Bind to `socket_path` (cleaning a stale file if no live daemon owns it)
 /// and serve connections until the listener errors. `cmd_tx` is the channel
 /// to the wayland thread (used for `copy` requests).
-pub async fn serve(
-    socket_path: PathBuf,
-    db_path: PathBuf,
-    cmd_tx: CmdSender,
-) -> Result<()> {
+pub async fn serve(socket_path: PathBuf, db_path: PathBuf, cmd_tx: CmdSender) -> Result<()> {
     bind_clean(&socket_path)?;
     let listener = UnixListener::bind(&socket_path)
         .with_context(|| format!("bind {}", socket_path.display()))?;
@@ -55,10 +51,7 @@ fn bind_clean(path: &Path) -> Result<()> {
         return Ok(());
     }
     match std::os::unix::net::UnixStream::connect(path) {
-        Ok(_) => anyhow::bail!(
-            "another hugind appears to be running at {}",
-            path.display()
-        ),
+        Ok(_) => anyhow::bail!("another hugind appears to be running at {}", path.display()),
         Err(_) => std::fs::remove_file(path)
             .with_context(|| format!("remove stale socket {}", path.display())),
     }
@@ -129,7 +122,11 @@ async fn dispatch<W: AsyncWriteExt + Unpin>(
                 Err(e) => write_error(wr, e.to_string()).await,
             }
         }
-        Request::Copy { id, selection } => {
+        Request::Copy {
+            id,
+            selection,
+            mime,
+        } => {
             let sel = match selection.as_deref() {
                 None | Some("regular") => Selection::Regular,
                 Some("primary") => Selection::Primary,
@@ -143,11 +140,19 @@ async fn dispatch<W: AsyncWriteExt + Unpin>(
                 storage::load_parts(&conn, id)
             })
             .await?;
-            let parts = match parts_result {
+            let mut parts = match parts_result {
                 Ok(Some(p)) => p,
                 Ok(None) => return write_error(wr, format!("no entry with id {id}")).await,
                 Err(e) => return write_error(wr, e.to_string()).await,
             };
+            // The picker's MIME chooser asks to serve a single MIME; restrict
+            // the source to it so the clipboard advertises only that type.
+            if let Some(m) = &mime {
+                parts.retain(|(part_mime, _)| part_mime == m);
+                if parts.is_empty() {
+                    return write_error(wr, format!("entry {id} has no MIME {m:?}")).await;
+                }
+            }
 
             let (reply_tx, reply_rx) = oneshot::channel();
             let send_result = {
@@ -169,7 +174,6 @@ async fn dispatch<W: AsyncWriteExt + Unpin>(
         }
         Request::Search {
             query,
-            raw,
             sort,
             limit,
             selection,
@@ -180,7 +184,6 @@ async fn dispatch<W: AsyncWriteExt + Unpin>(
                 storage::search(
                     &conn,
                     &query,
-                    raw,
                     sort,
                     limit.unwrap_or(50),
                     selection.as_deref(),
@@ -189,6 +192,25 @@ async fn dispatch<W: AsyncWriteExt + Unpin>(
             .await?;
             match result {
                 Ok(entries) => write_response(wr, &Response::Entries { entries }).await,
+                Err(e) => write_error(wr, e.to_string()).await,
+            }
+        }
+        Request::Delete { id } => {
+            let db = db_path.to_owned();
+            let result = tokio::task::spawn_blocking(move || -> Result<bool> {
+                let conn = Connection::open(&db)?;
+                // FK cascade clears mime_parts; foreign_keys is per-connection
+                // and OFF by default, so enable it here. busy_timeout lets a
+                // delete that races the storage thread's writer wait instead
+                // of failing with SQLITE_BUSY.
+                conn.busy_timeout(std::time::Duration::from_secs(5))?;
+                conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+                storage::delete(&conn, id)
+            })
+            .await?;
+            match result {
+                Ok(true) => write_response(wr, &Response::Ok).await,
+                Ok(false) => write_error(wr, format!("no entry with id {id}")).await,
                 Err(e) => write_error(wr, e.to_string()).await,
             }
         }
