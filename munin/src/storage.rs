@@ -719,3 +719,122 @@ fn push_or_continue(
         });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A temp file that deletes itself on drop, so the parser tests can feed
+    /// real on-disk content to `parse_*_history` (which take a `&Path`)
+    /// without pulling in a `tempfile` dependency.
+    struct TempFile(PathBuf);
+
+    impl TempFile {
+        fn new(content: &str) -> Self {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static N: AtomicU32 = AtomicU32::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            let path =
+                std::env::temp_dir().join(format!("munin-test-{}-{n}.hist", std::process::id()));
+            std::fs::write(&path, content).unwrap();
+            TempFile(path)
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    const SEC_NS: i64 = 1_000_000_000;
+
+    #[test]
+    fn zsh_extended_format() {
+        let f = TempFile::new(": 1700000000:5;echo hello\n: 1700000001:0;ls -la\n");
+        let out = parse_zsh_history(f.path()).unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].cmd, "echo hello");
+        assert_eq!(out[0].ts_unix_ns, 1_700_000_000 * SEC_NS);
+        assert_eq!(out[0].duration_ms, Some(5_000)); // 5s → 5000ms
+        assert_eq!(out[1].cmd, "ls -la");
+        assert_eq!(out[1].duration_ms, Some(0));
+    }
+
+    #[test]
+    fn zsh_backslash_continuation_joins_into_one_entry() {
+        // A multi-line command continued with trailing backslashes must come
+        // back as a single entry, not three.
+        let f = TempFile::new(": 1700000000:1;for i in 1 2 3; do \\\necho $i; \\\ndone\n");
+        let out = parse_zsh_history(f.path()).unwrap();
+        assert_eq!(
+            out.len(),
+            1,
+            "got {:?}",
+            out.iter().map(|e| &e.cmd).collect::<Vec<_>>()
+        );
+        assert!(out[0].cmd.starts_with("for i in 1 2 3; do"));
+        assert!(out[0].cmd.contains("echo $i"));
+        assert!(out[0].cmd.contains("done"));
+        assert_eq!(out[0].ts_unix_ns, 1_700_000_000 * SEC_NS);
+    }
+
+    #[test]
+    fn zsh_plain_format_gets_sequential_synthetic_timestamps() {
+        // No `: ts:dur;` prefix → file order preserved via increasing synth ts.
+        let f = TempFile::new("echo one\n\necho two\necho three\n");
+        let out = parse_zsh_history(f.path()).unwrap();
+        assert_eq!(
+            out.iter().map(|e| e.cmd.as_str()).collect::<Vec<_>>(),
+            vec!["echo one", "echo two", "echo three"]
+        );
+        // Blank line skipped; remaining rows numbered 1,2,3 in order.
+        assert_eq!(
+            out.iter().map(|e| e.ts_unix_ns).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert!(out.iter().all(|e| e.duration_ms.is_none()));
+    }
+
+    #[test]
+    fn bash_histtimeformat_pairs_timestamp_with_next_line() {
+        let f = TempFile::new("#1700000000\necho hello\nls\n");
+        let out = parse_bash_history(f.path()).unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].cmd, "echo hello");
+        assert_eq!(out[0].ts_unix_ns, 1_700_000_000 * SEC_NS);
+        // `ls` has no preceding `#ts`, so it falls back to a synthetic ts.
+        assert_eq!(out[1].cmd, "ls");
+        assert_eq!(out[1].ts_unix_ns, 1);
+    }
+
+    #[test]
+    fn bash_plain_lines_get_sequential_synthetic_timestamps() {
+        let f = TempFile::new("echo a\necho b\n");
+        let out = parse_bash_history(f.path()).unwrap();
+        assert_eq!(
+            out.iter()
+                .map(|e| (e.cmd.as_str(), e.ts_unix_ns))
+                .collect::<Vec<_>>(),
+            vec![("echo a", 1), ("echo b", 2)]
+        );
+    }
+
+    #[test]
+    fn highlight_wraps_contiguous_and_split_runs() {
+        // Contiguous match run gets one ‹…› pair.
+        assert_eq!(highlight_indices("git commit", &[0, 1, 2]), "‹git› commit");
+        // Two separate runs → two pairs.
+        assert_eq!(highlight_indices("abcd", &[0, 2]), "‹a›b‹c›d");
+    }
+
+    #[test]
+    fn highlight_is_multibyte_safe() {
+        // Index 3 is the multi-byte 'é'; markers must land on the char, not
+        // split its bytes (the function walks chars().enumerate()).
+        assert_eq!(highlight_indices("café x", &[3]), "caf‹é› x");
+    }
+}

@@ -39,6 +39,7 @@ pub async fn serve(socket_path: PathBuf, store_tx: StoreTx) -> Result<()> {
     bind_clean(&socket_path)?;
     let listener = UnixListener::bind(&socket_path)
         .with_context(|| format!("bind {}", socket_path.display()))?;
+    restrict_socket_permissions(&socket_path)?;
     info!(socket = %socket_path.display(), "ipc listening");
 
     // std::sync::mpsc::Sender is Clone + Send but not Sync; wrap in a Mutex so
@@ -55,6 +56,16 @@ pub async fn serve(socket_path: PathBuf, store_tx: StoreTx) -> Result<()> {
             }
         });
     }
+}
+
+/// Clamp the socket to owner-only (0600). A peer that can connect may inject
+/// `add-start` / `import` (history poisoning). Inside `$XDG_RUNTIME_DIR`
+/// (mode 0700) the directory gates access, but the `/tmp` fallback path is
+/// world-traversable — so we harden the socket itself.
+fn restrict_socket_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("chmod 0600 {}", path.display()))
 }
 
 /// If `path` exists, probe it; if no daemon answers, unlink it. If a daemon

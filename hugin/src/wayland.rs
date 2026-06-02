@@ -382,7 +382,7 @@ pub fn run(
         }
         if fds[0]
             .revents()
-            .map_or(false, |r| r.contains(PollFlags::POLLIN))
+            .is_some_and(|r| r.contains(PollFlags::POLLIN))
         {
             read_guard.read().context("read wayland events")?;
         } else {

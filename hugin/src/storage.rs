@@ -472,6 +472,10 @@ pub fn preview_text(conn: &Connection, id: i64, max_chars: usize) -> Result<Opti
 /// Tuple shape returned by row_to_tuple — (id, ts_unix_ns, selection, size_bytes, snippet).
 type RowTuple = (i64, i64, String, i64, Option<String>);
 
+/// One clipboard MIME variant: the MIME type and its raw bytes. An entry is a
+/// `Vec<MimePart>`.
+pub type MimePart = (String, Vec<u8>);
+
 /// Populate the mimes field on each entry with a single batched
 /// `WHERE entry_id IN (...)` query, then fan out via a HashMap. The
 /// previous per-row mime SELECT was an N+1 pattern that ran one
@@ -564,7 +568,7 @@ pub fn read_blob(
 
 /// Load every (mime, blob) pair for an entry. Returns `None` if the entry
 /// id does not exist. Used by `hugin copy` to repopulate the clipboard.
-pub fn load_parts(conn: &Connection, id: i64) -> Result<Option<Vec<(String, Vec<u8>)>>> {
+pub fn load_parts(conn: &Connection, id: i64) -> Result<Option<Vec<MimePart>>> {
     let exists: i64 = conn.query_row(
         "SELECT COUNT(*) FROM entries WHERE id = ?1",
         params![id],

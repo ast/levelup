@@ -61,3 +61,19 @@ pub fn fmt_dur(ms: Option<i64>) -> String {
         format!("{}m{:02}s", s / 60, s % 60)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fmt_dur_buckets() {
+        assert_eq!(fmt_dur(None), "-");
+        assert_eq!(fmt_dur(Some(0)), "0ms");
+        assert_eq!(fmt_dur(Some(345)), "345ms");
+        assert_eq!(fmt_dur(Some(999)), "999ms");
+        assert_eq!(fmt_dur(Some(3_400)), "3.4s"); // sub-minute → seconds
+        assert_eq!(fmt_dur(Some(83_000)), "1m23s"); // ≥1min → m+s, zero-padded
+        assert_eq!(fmt_dur(Some(3_600_000)), "60m00s");
+    }
+}

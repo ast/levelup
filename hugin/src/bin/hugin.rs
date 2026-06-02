@@ -269,8 +269,8 @@ fn print_table(entries: &[EntryMeta]) {
         return;
     }
     println!(
-        "{:<6} {:<19} {:<8} {:<9} {}",
-        "ID", "TIME", "SEL", "SIZE", "SNIPPET"
+        "{:<6} {:<19} {:<8} {:<9} SNIPPET",
+        "ID", "TIME", "SEL", "SIZE"
     );
     for e in entries {
         let snippet = e.snippet.as_deref().unwrap_or("");

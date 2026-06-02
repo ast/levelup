@@ -25,6 +25,7 @@ pub async fn serve(socket_path: PathBuf, db_path: PathBuf, cmd_tx: CmdSender) ->
     bind_clean(&socket_path)?;
     let listener = UnixListener::bind(&socket_path)
         .with_context(|| format!("bind {}", socket_path.display()))?;
+    restrict_socket_permissions(&socket_path)?;
     info!(socket = %socket_path.display(), "ipc listening");
 
     // std::sync::mpsc::Sender is Clone + Send but not Sync; wrap in a
@@ -42,6 +43,18 @@ pub async fn serve(socket_path: PathBuf, db_path: PathBuf, cmd_tx: CmdSender) ->
             }
         });
     }
+}
+
+/// Clamp the socket to owner-only (0600). The clipboard IPC surface exposes
+/// `list` / `get` / `read-blob` with no authentication, so anyone able to
+/// connect can read the entire clipboard history. Inside `$XDG_RUNTIME_DIR`
+/// (mode 0700) the directory already gates access, but the `/tmp` fallback
+/// path is world-traversable — so we harden the socket itself rather than
+/// relying on where it happens to live.
+fn restrict_socket_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("chmod 0600 {}", path.display()))
 }
 
 /// If `path` exists, probe it; if no daemon answers, unlink. If a daemon does
