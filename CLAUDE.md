@@ -158,7 +158,7 @@ selection_fg = "black"
 selection_bg = "cyan"
 match_fg = "yellow"
 prompt_fg = "green"
-status_fg = "gray"
+status_fg = "darkgray"
 ```
 
 Colours accept the named ANSI palette (`black`/`red`/.../`gray`/`darkgray`/`light*`). Hex / 24-bit can be added later without breaking existing configs because `serde(deny_unknown_fields)` is **not** set on the colour palette — only the top-level config — so colour additions are forward-compatible. Adding a new shell-script knob (or future TUI option) means another field with a `Default` impl and a docs line here.

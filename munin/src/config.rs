@@ -68,7 +68,7 @@ impl Default for Colors {
             selection_bg: ColorName::Cyan,
             match_fg: ColorName::Yellow,
             prompt_fg: ColorName::Green,
-            status_fg: ColorName::Gray,
+            status_fg: ColorName::DarkGray,
         }
     }
 }
