@@ -96,3 +96,66 @@ pub fn human_size(n: i64) -> String {
         format!("{n}B")
     }
 }
+
+/// Make arbitrary clipboard text safe to print to a terminal. Clipboard content
+/// is fully untrusted — copying a crafted string can embed control bytes that
+/// *drive* the terminal (e.g. `ESC[?1003h` enables mouse reporting, spewing
+/// motion reports over the prompt). We sanitize at the display boundary
+/// (storage stays byte-faithful): C0 → caret notation (`^[`), DEL → `^?`,
+/// newline → `↵`, tab → space, other control (C1) → U+FFFD.
+pub fn sanitize_display(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\n' => out.push('\u{21B5}'),
+            '\t' => out.push(' '),
+            '\u{7f}' => out.push_str("^?"),
+            c if (c as u32) < 0x20 => {
+                out.push('^');
+                out.push((b'@' + c as u8) as char);
+            }
+            c if c.is_control() => out.push('\u{FFFD}'),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Like [`sanitize_display`] but preserves newlines and tabs, for multi-line
+/// views (the preview pane) where real line breaks drive the layout. Still
+/// neutralizes ESC and the other control bytes that could drive the terminal.
+pub fn sanitize_multiline(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\n' | '\t' => out.push(c),
+            '\u{7f}' => out.push_str("^?"),
+            c if (c as u32) < 0x20 => {
+                out.push('^');
+                out.push((b'@' + c as u8) as char);
+            }
+            c if c.is_control() => out.push('\u{FFFD}'),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{sanitize_display, sanitize_multiline};
+
+    #[test]
+    fn sanitize_neutralizes_control_bytes() {
+        assert_eq!(sanitize_display("a\x1b[?1003hb"), "a^[[?1003hb");
+        assert_eq!(sanitize_display("x\ty\nz"), "x y\u{21B5}z");
+        assert_eq!(sanitize_display("a\x7fb"), "a^?b");
+        assert_eq!(sanitize_display("plain ‹m›"), "plain ‹m›");
+    }
+
+    #[test]
+    fn sanitize_multiline_keeps_layout_whitespace() {
+        // Newlines and tabs survive (the preview pane needs them); ESC doesn't.
+        assert_eq!(sanitize_multiline("a\nb\tc\x1b[0m"), "a\nb\tc^[[0m");
+    }
+}

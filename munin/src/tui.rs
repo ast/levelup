@@ -33,9 +33,9 @@ use ratatui::widgets::{List, ListItem, ListState, Paragraph};
 use rusqlite::Connection;
 
 use crate::config::{Config, Layout};
-use crate::fmt_dur;
 use crate::proto::{EntryMeta, Filters, SearchSort};
 use crate::storage;
+use crate::{fmt_dur, sanitize_display};
 
 /// What the user did. The bin layer maps each variant to a different exit
 /// code so the shell hook can distinguish "run this" from "drop this on the
@@ -452,12 +452,16 @@ fn render_row(entry: &EntryMeta, match_fg: ratatui::style::Color) -> Line<'stati
     if let Some(snippet) = entry.snippet.as_deref() {
         spans.extend(highlight_snippet(snippet, match_fg));
     } else {
-        spans.push(Span::raw(entry.cmd.replace('\n', "\u{21B5}")));
+        spans.push(Span::raw(sanitize_display(&entry.cmd)));
     }
     Line::from(spans)
 }
 
 fn highlight_snippet(s: &str, match_fg: ratatui::style::Color) -> Vec<Span<'static>> {
+    // Neutralize control bytes up front (a stored `ESC[?1003h` would otherwise
+    // drive the terminal). `sanitize_display` never emits `‹`/`›`, so the match
+    // markers survive and the parse below stays correct.
+    let s = sanitize_display(s);
     let mut spans = Vec::new();
     let mut buf = String::new();
     let mut in_match = false;

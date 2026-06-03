@@ -62,9 +62,48 @@ pub fn fmt_dur(ms: Option<i64>) -> String {
     }
 }
 
+/// Make arbitrary stored text safe to print to a terminal. Stored commands can
+/// contain raw control bytes (bracketed-paste markers from imports, escape
+/// sequences from pasted input) that would otherwise *drive* the terminal —
+/// e.g. a stored `ESC[?1003h` flips it into mouse-reporting mode. We sanitize
+/// at the display boundary (storage stays faithful for sync): C0 → caret
+/// notation (`^[`), DEL → `^?`, newline → `↵`, tab → space, other control
+/// (C1) → U+FFFD. Shared by the CLI's printers and the TUI's row renderer.
+pub fn sanitize_display(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\n' => out.push('\u{21B5}'),
+            '\t' => out.push(' '),
+            '\u{7f}' => out.push_str("^?"),
+            c if (c as u32) < 0x20 => {
+                out.push('^');
+                out.push((b'@' + c as u8) as char);
+            }
+            c if c.is_control() => out.push('\u{FFFD}'),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sanitize_neutralizes_control_bytes() {
+        // The exact attack: a stored escape that enables mouse reporting.
+        assert_eq!(sanitize_display("a\x1b[?1003hb"), "a^[[?1003hb");
+        // Bracketed-paste prefix from atuin imports.
+        assert_eq!(sanitize_display("\x1b[200~ls"), "^[[200~ls");
+        // Whitespace handling: tab → space, newline → ↵.
+        assert_eq!(sanitize_display("x\ty\nz"), "x y\u{21B5}z");
+        // DEL and a C1 byte.
+        assert_eq!(sanitize_display("a\x7fb\u{0085}c"), "a^?b\u{FFFD}c");
+        // Plain text (incl. the ‹› highlight markers) is untouched.
+        assert_eq!(sanitize_display("git ‹commit›"), "git ‹commit›");
+    }
 
     #[test]
     fn fmt_dur_buckets() {

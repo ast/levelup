@@ -14,7 +14,7 @@ use munin::proto::{EntryMeta, Filters, Request, Response, SearchSort};
 use munin::shells::{self, Shell};
 use munin::storage::{self, default_db_path};
 use munin::tui::Outcome;
-use munin::{current_hostname, default_socket_path, fmt_dur, now_unix_ns, tui};
+use munin::{current_hostname, default_socket_path, fmt_dur, now_unix_ns, sanitize_display, tui};
 
 #[derive(Parser)]
 #[command(
@@ -413,12 +413,11 @@ fn print_table(entries: &[EntryMeta]) {
         // `search` populates `snippet` with `‹match›` markers; `list`/`get`
         // leave it None and we fall back to the raw cmd.
         let raw = e.snippet.as_deref().unwrap_or(&e.cmd);
-        let mut display: String = raw
-            .chars()
-            .take(80)
-            .collect::<String>()
-            .replace('\n', "\u{21B5}")
-            .replace('\t', " ");
+        // sanitize_display neutralizes control bytes (a stored `ESC[?1003h`
+        // would otherwise flip the terminal into mouse-reporting mode) and maps
+        // newline → ↵ / tab → space. Sanitize before truncating so the 80-char
+        // budget counts display columns, not raw bytes.
+        let mut display: String = sanitize_display(raw).chars().take(80).collect();
         // Truncation can land inside a `‹match›` pair, leaving a dangling
         // opener that visually merges with the next column. Close each
         // unbalanced opener so the row stays readable.
@@ -455,7 +454,7 @@ fn print_entry(e: &EntryMeta) {
         println!("session:     {s}");
     }
     if let Some(c) = &e.cwd {
-        println!("cwd:         {c}");
+        println!("cwd:         {}", sanitize_display(c));
     }
     if let Some(rc) = e.exit_code {
         println!("exit_code:   {rc}");
@@ -463,7 +462,7 @@ fn print_entry(e: &EntryMeta) {
     if let Some(d) = e.duration_ms {
         println!("duration_ms: {d}");
     }
-    println!("cmd:         {}", e.cmd);
+    println!("cmd:         {}", sanitize_display(&e.cmd));
 }
 
 fn fmt_ts(ns: i64) -> String {

@@ -10,7 +10,7 @@ use clap_complete::Shell;
 
 use hugin::proto::{EntryMeta, Request, Response, SearchSort};
 use hugin::tui::{self, Outcome};
-use hugin::{config, default_socket_path, fmt_ts, human_size, storage};
+use hugin::{config, default_socket_path, fmt_ts, human_size, sanitize_display, storage};
 
 #[derive(Parser)]
 #[command(name = "hugin", version, about = "Query the hugin clipboard daemon")]
@@ -274,12 +274,11 @@ fn print_table(entries: &[EntryMeta]) {
     );
     for e in entries {
         let snippet = e.snippet.as_deref().unwrap_or("");
-        let mut label: String = snippet
-            .chars()
-            .take(60)
-            .collect::<String>()
-            .replace('\n', "\u{21B5}")
-            .replace('\t', " ");
+        // sanitize_display neutralizes control bytes from untrusted clipboard
+        // text (a stored `ESC[?1003h` would flip the terminal into mouse mode)
+        // and maps newline → ↵ / tab → space. Sanitize before truncating so the
+        // 60-char budget counts display columns.
+        let mut label: String = sanitize_display(snippet).chars().take(60).collect();
         // Search snippets carry ‹match› markers. If truncation lands inside
         // a pair we'd render a dangling ‹ — append a closer for each
         // unclosed opener so the row stays balanced.
@@ -318,6 +317,7 @@ fn print_info(e: &EntryMeta) {
         println!("  - {m}");
     }
     if let Some(s) = &e.snippet {
-        println!("snippet:   {}", s.chars().take(200).collect::<String>());
+        let s: String = s.chars().take(200).collect();
+        println!("snippet:   {}", sanitize_display(&s));
     }
 }

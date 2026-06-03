@@ -43,7 +43,7 @@ use rusqlite::Connection;
 use crate::client::Client;
 use crate::config::{Config, Layout};
 use crate::proto::{EntryMeta, Request, SearchSort};
-use crate::{human_size, storage};
+use crate::{human_size, sanitize_display, sanitize_multiline, storage};
 
 /// How much of the selected entry's text to pull for the preview pane.
 const PREVIEW_CHARS: usize = 10_000;
@@ -707,7 +707,7 @@ fn render_row(entry: &EntryMeta, match_fg: ratatui::style::Color) -> Line<'stati
         spans.extend(highlight_snippet(snippet, match_fg));
     } else {
         spans.push(Span::styled(
-            format!("[{}]", entry.mimes.join(", ")),
+            format!("[{}]", sanitize_display(&entry.mimes.join(", "))),
             Style::default().add_modifier(Modifier::DIM),
         ));
     }
@@ -715,6 +715,10 @@ fn render_row(entry: &EntryMeta, match_fg: ratatui::style::Color) -> Line<'stati
 }
 
 fn highlight_snippet(s: &str, match_fg: ratatui::style::Color) -> Vec<Span<'static>> {
+    // Neutralize control bytes up front (clipboard text is fully untrusted; a
+    // stored `ESC[?1003h` would drive the terminal). `sanitize_display` never
+    // emits `‹`/`›`, so the match markers survive and the parse stays correct.
+    let s = sanitize_display(s);
     let mut spans = Vec::new();
     let mut buf = String::new();
     let mut in_match = false;
@@ -830,7 +834,10 @@ fn render_preview(f: &mut ratatui::Frame<'_>, state: &State, cfg: &Config, area:
         .title(" preview ")
         .style(Style::default().fg(cfg.colors.status_fg.to_ratatui()));
     let body = match &state.preview {
-        Some((_, Preview::Text(t))) => t.clone(),
+        // Clipboard text is fully untrusted; neutralize control bytes but keep
+        // newlines/tabs so the preview still wraps as real lines. The Binary
+        // variant is metadata we built ourselves, so it's already safe.
+        Some((_, Preview::Text(t))) => sanitize_multiline(t),
         Some((_, Preview::Binary(m))) => m.clone(),
         None => String::new(),
     };
