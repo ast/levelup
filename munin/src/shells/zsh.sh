@@ -10,16 +10,23 @@ export MUNIN_SHELL=zsh
 
 _munin_active=0
 
+# Capture runs SYNCHRONOUSLY (no `&!`). `munin` writes straight to SQLite and
+# add-end pairs to the session's open row by SQL; if the two calls were
+# backgrounded they could reorder, so add-end would close the wrong command
+# (scrambling exit codes) and processes could be torn down on shell exit
+# (dropping rows). Foreground keeps them in order — within one shell, commands
+# are serial, so there's exactly one open row per session at precmd time. The
+# cost is ~5 ms per call (process spawn + WAL write); imperceptible.
 _munin_preexec() {
     _munin_active=1
-    command munin add-start -- "$1" "$MUNIN_SESSION" 2>/dev/null &!
+    command munin add-start -- "$1" "$MUNIN_SESSION" 2>/dev/null
 }
 
 _munin_precmd() {
     local rc=$?
     if (( _munin_active )); then
         _munin_active=0
-        command munin add-end -- "$MUNIN_SESSION" "$rc" 2>/dev/null &!
+        command munin add-end -- "$MUNIN_SESSION" "$rc" 2>/dev/null
     fi
 }
 

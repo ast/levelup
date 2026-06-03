@@ -11,7 +11,7 @@
 //! the TUI is a short-lived read-only client and per-keystroke IPC would
 //! add unnecessary latency.
 
-use std::io::{self, Stdout};
+use std::fs::File;
 use std::path::Path;
 use std::time::Duration;
 
@@ -103,7 +103,7 @@ impl State {
 }
 
 fn run_loop(
-    term: &mut Terminal<CrosstermBackend<Stdout>>,
+    term: &mut Terminal<CrosstermBackend<File>>,
     conn: &Connection,
     initial_query: String,
     filters: Filters,
@@ -531,15 +531,26 @@ fn render_prompt(f: &mut ratatui::Frame<'_>, state: &State, cfg: &Config, area: 
     }
 }
 
-fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
+fn setup_terminal() -> Result<Terminal<CrosstermBackend<File>>> {
+    // Render to /dev/tty, NOT stdout: the shell hook invokes the picker as
+    // `chosen=$(munin search -i ...)`, so stdout is captured for the chosen
+    // command. If the alternate-screen drawing went to stdout it would be
+    // swallowed into that variable (the screen stays blank and the escape
+    // codes end up on the command line). Writing to the controlling terminal
+    // directly — the fzf/atuin approach — keeps stdout clean for the result.
+    // crossterm reads input events from /dev/tty itself, so input is unaffected.
+    let mut tty = File::options()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .context("open /dev/tty")?;
     enable_raw_mode().context("enable raw mode")?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture).context("enter alternate screen")?;
-    let backend = CrosstermBackend::new(stdout);
+    execute!(tty, EnterAlternateScreen, EnableMouseCapture).context("enter alternate screen")?;
+    let backend = CrosstermBackend::new(tty);
     Terminal::new(backend).context("create terminal")
 }
 
-fn restore_terminal(term: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+fn restore_terminal(term: &mut Terminal<CrosstermBackend<File>>) -> Result<()> {
     disable_raw_mode().context("disable raw mode")?;
     execute!(
         term.backend_mut(),

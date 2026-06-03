@@ -27,7 +27,6 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::oneshot;
 use tracing::{info, warn};
 
-use crate::now_unix_ns;
 use crate::proto::{Request, Response};
 use crate::storage::StoreCmd;
 
@@ -119,50 +118,6 @@ async fn dispatch<W: AsyncWriteExt + Unpin>(
 ) -> Result<()> {
     match req {
         Request::Ping => write_response(wr, &Response::Ok).await,
-        Request::AddStart {
-            cmd,
-            session,
-            ts_unix_ns,
-            cwd,
-            hostname,
-            shell,
-        } => {
-            let ts_unix_ns = ts_unix_ns.unwrap_or_else(now_unix_ns);
-            let send_result = {
-                let guard = store_tx.lock().expect("store_tx poisoned");
-                guard.send(StoreCmd::AddStart {
-                    cmd,
-                    session,
-                    ts_unix_ns,
-                    cwd,
-                    hostname,
-                    shell,
-                })
-            };
-            if let Err(e) = send_result {
-                warn!(error = %e, "storage thread unavailable for add-start");
-            }
-            Ok(())
-        }
-        Request::AddEnd {
-            session,
-            exit_code,
-            ts_unix_ns,
-        } => {
-            let ts_unix_ns = ts_unix_ns.unwrap_or_else(now_unix_ns);
-            let send_result = {
-                let guard = store_tx.lock().expect("store_tx poisoned");
-                guard.send(StoreCmd::AddEnd {
-                    session,
-                    exit_code,
-                    ts_unix_ns,
-                })
-            };
-            if let Err(e) = send_result {
-                warn!(error = %e, "storage thread unavailable for add-end");
-            }
-            Ok(())
-        }
         Request::Import { path, source } => {
             let (reply_tx, reply_rx) = oneshot::channel();
             let send_result = {

@@ -24,15 +24,14 @@ use munin::{current_hostname, default_socket_path, fmt_dur, now_unix_ns, tui};
 )]
 struct Cli {
     /// Override the daemon socket path. Default: $XDG_RUNTIME_DIR/munin.sock.
-    /// Only used by daemon-routed subcommands (ping, add-start, add-end,
-    /// import).
+    /// Only used by daemon-routed subcommands (ping, import).
     #[arg(long, value_name = "PATH")]
     socket: Option<PathBuf>,
 
     /// Override the SQLite database path. Default:
-    /// $XDG_DATA_HOME/munin/munin.db. Only affects read subcommands
-    /// (list, search, get) and the interactive TUI — those open the DB
-    /// directly.
+    /// $XDG_DATA_HOME/munin/munin.db. Affects the subcommands that open the
+    /// DB directly: the captures (add-start, add-end), the reads (list,
+    /// search, get), and the interactive TUI.
     #[arg(long, value_name = "PATH")]
     db: Option<PathBuf>,
 
@@ -44,17 +43,16 @@ struct Cli {
 enum Cmd {
     /// Verify the daemon is responsive
     Ping,
-    /// Record the start of a shell command (used by shell hooks).
-    /// Fire-and-forget — the daemon does not respond, the CLI exits as soon
-    /// as the request is written.
+    /// Record the start of a shell command (used by shell hooks). Writes
+    /// directly to SQLite — works whether or not the daemon is running.
     AddStart {
         /// The command line about to run.
         cmd: String,
         /// Stable identifier for this shell session (typically $$).
         session: String,
     },
-    /// Record the exit of the most recent command in this session.
-    /// Fire-and-forget.
+    /// Record the exit of the most recent command in this session. Writes
+    /// directly to SQLite — works whether or not the daemon is running.
     AddEnd {
         /// Session id passed to the matching add-start.
         session: String,
@@ -179,6 +177,9 @@ fn main() -> Result<()> {
 
     // Subcommands that don't need the daemon:
     //   - `init` (just prints an embedded script)
+    //   - `add-start` / `add-end` (write straight to SQLite so capture keeps
+    //     working when munind is down — the whole point of the daemon-free
+    //     capture path)
     //   - `search -i` (interactive TUI, opens SQLite directly)
     //   - `list` / `search` (non-interactive) / `get` (read straight from
     //     the DB so the read CLI keeps working when munind is down)
@@ -187,6 +188,9 @@ fn main() -> Result<()> {
             print!("{}", shells::init_script(shell));
             return Ok(());
         }
+        Cmd::AddStart { .. } | Cmd::AddEnd { .. } => {
+            return run_capture(cli.cmd, cli.db.as_deref());
+        }
         Cmd::Search {
             interactive: true, ..
         } => return run_tui(cli.cmd, cli.db.as_deref()),
@@ -194,7 +198,7 @@ fn main() -> Result<()> {
             return run_read(cli.cmd, cli.db.as_deref());
         }
         // Fall through to the daemon-routed path below.
-        Cmd::Ping | Cmd::AddStart { .. } | Cmd::AddEnd { .. } | Cmd::Import { .. } => {}
+        Cmd::Ping | Cmd::Import { .. } => {}
     }
 
     let path = cli.socket.unwrap_or_else(default_socket_path);
@@ -211,39 +215,6 @@ fn main() -> Result<()> {
                 Response::Error { message } => return Err(anyhow!("{message}")),
                 other => return Err(unexpected("ping", &other)),
             }
-        }
-        Cmd::AddStart { cmd, session } => {
-            let cwd = std::env::current_dir()
-                .ok()
-                .map(|p| p.display().to_string());
-            // `MUNIN_SHELL` is exported by `munin init <shell>` so we know
-            // which shell is actually calling us (rather than guessing from
-            // the user's login `$SHELL`, which doesn't change for nested bash).
-            let shell = std::env::var("MUNIN_SHELL")
-                .ok()
-                .or_else(|| std::env::var("SHELL").ok());
-            send(
-                &mut writer,
-                &Request::AddStart {
-                    cmd,
-                    session,
-                    ts_unix_ns: Some(now_unix_ns()),
-                    cwd,
-                    hostname: current_hostname(),
-                    shell,
-                },
-            )?;
-            // Fire-and-forget: no response expected.
-        }
-        Cmd::AddEnd { session, exit_code } => {
-            send(
-                &mut writer,
-                &Request::AddEnd {
-                    session,
-                    exit_code,
-                    ts_unix_ns: Some(now_unix_ns()),
-                },
-            )?;
         }
         Cmd::Import { from } => {
             let (path, source) = match from {
@@ -275,9 +246,51 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Init { .. } => unreachable!("Init returns at the prefix match"),
+        Cmd::AddStart { .. } | Cmd::AddEnd { .. } => {
+            unreachable!("captures return from run_capture at the prefix match")
+        }
         Cmd::List { .. } | Cmd::Search { .. } | Cmd::Get { .. } => {
             unreachable!("read commands return from run_read at the prefix match")
         }
+    }
+    Ok(())
+}
+
+/// Record a command's start/end by writing straight to SQLite — no daemon.
+///
+/// The shell hooks (`munin init <shell>`) background this with `&!`, so the
+/// brief blocking write never stalls the prompt, and capture keeps working
+/// whether or not `munind` is running. `Store::open` creates the DB, applies
+/// the schema, and bootstraps `client_id`, so the very first capture on a
+/// fresh machine works even if the daemon has never run.
+fn run_capture(cmd: Cmd, db_override: Option<&Path>) -> Result<()> {
+    let db_path = resolve_db_path(db_override)?;
+    let store =
+        storage::Store::open(&db_path).with_context(|| format!("open db {}", db_path.display()))?;
+    match cmd {
+        Cmd::AddStart { cmd, session } => {
+            let cwd = std::env::current_dir()
+                .ok()
+                .map(|p| p.display().to_string());
+            // `MUNIN_SHELL` is exported by `munin init <shell>` so we know
+            // which shell is actually calling us (rather than guessing from
+            // the user's login `$SHELL`, which doesn't change for nested bash).
+            let shell = std::env::var("MUNIN_SHELL")
+                .ok()
+                .or_else(|| std::env::var("SHELL").ok());
+            store.add_start(
+                &cmd,
+                &session,
+                now_unix_ns(),
+                cwd.as_deref(),
+                current_hostname().as_deref(),
+                shell.as_deref(),
+            )?;
+        }
+        Cmd::AddEnd { session, exit_code } => {
+            store.add_end(&session, exit_code, now_unix_ns())?;
+        }
+        _ => unreachable!("run_capture called with non-capture command"),
     }
     Ok(())
 }

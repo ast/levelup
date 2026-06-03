@@ -2,13 +2,14 @@
 //!
 //! `munind`'s `Connection` is owned by exactly one OS thread
 //! (`munin-storage`) and reached via `mpsc<StoreCmd>` for the daemon's
-//! writes (captures + imports). Reads (`list`/`search`/`get`) are NOT
-//! routed through the daemon at all — the CLI opens its own
-//! `Connection` directly against the SQLite file (`bin/munin.rs::run_read`)
-//! and calls the standalone functions at the bottom of this module. WAL
-//! mode makes the concurrent read safe alongside the daemon's writer.
+//! writes (currently bulk `import`; sync later). Captures
+//! (`add-start`/`add-end`) and reads (`list`/`search`/`get`) do NOT go
+//! through the daemon at all — the CLI opens its own `Connection`
+//! directly against the SQLite file (`bin/munin.rs`) and calls
+//! `Store::add_start`/`add_end` or the standalone read functions at the
+//! bottom of this module. WAL mode + `busy_timeout` make these concurrent
+//! writers/readers safe alongside the daemon.
 
-use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -77,20 +78,12 @@ const GET_SQL: &str = "\
     FROM entries WHERE id = ?1";
 
 /// Write commands routed through the storage thread.
+///
+/// Captures (`add-start` / `add-end`) are *not* here — the CLI writes them
+/// directly to SQLite so they work without the daemon (see `Store::add_start`
+/// / `Store::add_end`). The daemon's storage thread is for bulk `import` now
+/// and cross-machine sync later.
 pub enum StoreCmd {
-    AddStart {
-        cmd: String,
-        session: String,
-        ts_unix_ns: i64,
-        cwd: Option<String>,
-        hostname: Option<String>,
-        shell: Option<String>,
-    },
-    AddEnd {
-        session: String,
-        exit_code: i32,
-        ts_unix_ns: i64,
-    },
     Import {
         path: PathBuf,
         /// `"zsh"` / `"bash"` (text history files) or `"atuin"` (SQLite DB).
@@ -102,10 +95,6 @@ pub enum StoreCmd {
 pub struct Store {
     conn: Connection,
     client_id: String,
-    /// `session → (row_id, start_ts_unix_ns)` for open commands awaiting their
-    /// matching `AddEnd`. Bounded by the number of live shell sessions on the
-    /// machine, so memory is not a concern.
-    open: HashMap<String, (i64, i64)>,
 }
 
 impl Store {
@@ -119,8 +108,14 @@ impl Store {
         // disk, and we don't want to scatter them around a DB we're about to
         // refuse.
         ensure_compatible_schema(&conn, path)?;
-        conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;")
-            .context("set pragmas")?;
+        // `busy_timeout` matters now that captures write directly from the CLI:
+        // a `munin add-start` and a concurrent daemon `import` (or two shells)
+        // can contend for the single WAL writer, and we want the loser to wait
+        // rather than fail with SQLITE_BUSY.
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;",
+        )
+        .context("set pragmas")?;
         // Schema apply and the version stamp must be atomic. A crash between
         // CREATE TABLE entries and the user_version write would leave a v0 DB
         // with an entries table, which ensure_compatible_schema then rejects.
@@ -132,22 +127,22 @@ impl Store {
 
         let client_id = ensure_client_id(&conn)?;
 
-        Ok(Self {
-            conn,
-            client_id,
-            open: HashMap::new(),
-        })
+        Ok(Self { conn, client_id })
     }
 
     pub fn client_id(&self) -> &str {
         &self.client_id
     }
 
-    /// Insert a row for the just-started command and remember its row id so
-    /// the matching `AddEnd` can close it out. `cmd` is dropped silently if it
-    /// begins with whitespace (atuin / `HIST_IGNORE_SPACE` convention).
+    /// Insert a row for the just-started command. `cmd` is dropped silently if
+    /// it begins with whitespace (atuin / `HIST_IGNORE_SPACE` convention).
+    ///
+    /// No in-memory state is kept: `add_start` and the matching `add_end` run
+    /// in *separate* short-lived `munin` CLI processes (the shell's preexec and
+    /// precmd hooks), so the open command is recovered from SQL in `add_end`
+    /// rather than from a `HashMap`.
     pub fn add_start(
-        &mut self,
+        &self,
         cmd: &str,
         session: &str,
         ts_unix_ns: i64,
@@ -174,20 +169,28 @@ impl Store {
                 shell,
             ],
         )?;
-        let id = self.conn.last_insert_rowid();
-        self.open.insert(session.to_owned(), (id, ts_unix_ns));
-        Ok(Some(id))
+        Ok(Some(self.conn.last_insert_rowid()))
     }
 
-    /// Close out the most-recent open command for `session`. Returns the row
-    /// id that was updated, or `None` if there was no matching open row.
-    pub fn add_end(
-        &mut self,
-        session: &str,
-        exit_code: i32,
-        ts_unix_ns: i64,
-    ) -> Result<Option<i64>> {
-        let Some((id, started_at)) = self.open.remove(session) else {
+    /// Close out the most-recent open command for `session` — the newest row
+    /// for that session still missing its `exit_code`. Returns the row id that
+    /// was updated, or `None` if there was no matching open row (e.g. a precmd
+    /// with no preexec). Duration is computed from the row's own start ts.
+    ///
+    /// Interactive shells run commands serially, so "newest open row for this
+    /// session" is unambiguous — there is at most one in flight at a time.
+    pub fn add_end(&self, session: &str, exit_code: i32, ts_unix_ns: i64) -> Result<Option<i64>> {
+        let open: Option<(i64, i64)> = self
+            .conn
+            .query_row(
+                "SELECT id, ts_unix_ns FROM entries \
+                 WHERE session = ?1 AND exit_code IS NULL \
+                 ORDER BY id DESC LIMIT 1",
+                params![session],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((id, started_at)) = open else {
             debug!(session, exit_code, "add-end with no matching open row");
             return Ok(None);
         };
@@ -321,22 +324,23 @@ impl Store {
 /// (UUIDv4) on first start. The id is stable per machine and gets stamped
 /// onto every captured row — sync uses it to attribute history to a host.
 fn ensure_client_id(conn: &Connection) -> Result<String> {
-    let existing: Option<String> = conn
-        .query_row(
-            "SELECT value FROM config WHERE key = 'client_id'",
-            [],
-            |r| r.get(0),
-        )
-        .optional()?;
-    if let Some(id) = existing {
-        return Ok(id);
-    }
-    let id = Uuid::new_v4().to_string();
-    conn.execute(
-        "INSERT INTO config (key, value) VALUES ('client_id', ?1)",
-        params![id],
+    // `INSERT OR IGNORE` then re-`SELECT`, rather than SELECT-then-INSERT: a
+    // direct-write capture can now create the DB concurrently with the daemon's
+    // first start, and two racing INSERTs would otherwise trip the `config.key`
+    // UNIQUE constraint. Whoever wins the insert sets the id; both then read it.
+    let candidate = Uuid::new_v4().to_string();
+    let inserted = conn.execute(
+        "INSERT OR IGNORE INTO config (key, value) VALUES ('client_id', ?1)",
+        params![candidate],
     )?;
-    info!(client_id = %id, "generated new client_id");
+    let id: String = conn.query_row(
+        "SELECT value FROM config WHERE key = 'client_id'",
+        [],
+        |r| r.get(0),
+    )?;
+    if inserted > 0 {
+        info!(client_id = %id, "generated new client_id");
+    }
     Ok(id)
 }
 
@@ -392,34 +396,6 @@ pub fn run_storage_thread(mut store: Store, rx: mpsc::Receiver<StoreCmd>) {
     info!(client_id = %store.client_id(), "storage ready");
     for cmd in rx {
         match cmd {
-            StoreCmd::AddStart {
-                cmd,
-                session,
-                ts_unix_ns,
-                cwd,
-                hostname,
-                shell,
-            } => match store.add_start(
-                &cmd,
-                &session,
-                ts_unix_ns,
-                cwd.as_deref(),
-                hostname.as_deref(),
-                shell.as_deref(),
-            ) {
-                Ok(Some(id)) => info!(id, session, cmd, "add-start"),
-                Ok(None) => {}
-                Err(e) => warn!(error = %e, session, "add-start failed"),
-            },
-            StoreCmd::AddEnd {
-                session,
-                exit_code,
-                ts_unix_ns,
-            } => match store.add_end(&session, exit_code, ts_unix_ns) {
-                Ok(Some(id)) => info!(id, session, exit_code, "add-end"),
-                Ok(None) => {}
-                Err(e) => warn!(error = %e, session, "add-end failed"),
-            },
             StoreCmd::Import {
                 path,
                 source,
@@ -829,6 +805,87 @@ mod tests {
         assert_eq!(highlight_indices("git commit", &[0, 1, 2]), "‹git› commit");
         // Two separate runs → two pairs.
         assert_eq!(highlight_indices("abcd", &[0, 2]), "‹a›b‹c›d");
+    }
+
+    /// A temp SQLite path that removes the db and its `-wal`/`-shm` sidecars
+    /// on drop.
+    struct TempDb(PathBuf);
+
+    impl TempDb {
+        fn new() -> Self {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static N: AtomicU32 = AtomicU32::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            let path =
+                std::env::temp_dir().join(format!("munin-test-{}-{n}.db", std::process::id()));
+            TempDb(path)
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDb {
+        fn drop(&mut self) {
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{suffix}", self.0.display()));
+            }
+        }
+    }
+
+    #[test]
+    fn add_end_matches_open_row_across_separate_store_instances() {
+        // The shell's preexec and precmd run `munin` as two separate
+        // processes, so add_start and add_end must connect their start/end
+        // through SQL, not shared memory. Two distinct Store instances on the
+        // same file stand in for those two processes.
+        let db = TempDb::new();
+        let t0 = 1_700_000_000 * SEC_NS;
+
+        let id = {
+            let store = Store::open(db.path()).unwrap();
+            store
+                .add_start("echo hi", "sess-A", t0, None, None, Some("zsh"))
+                .unwrap()
+                .expect("add_start inserts a row")
+        };
+
+        let closed = {
+            let store = Store::open(db.path()).unwrap();
+            store
+                .add_end("sess-A", 0, t0 + 5 * SEC_NS)
+                .unwrap()
+                .expect("add_end finds the open row")
+        };
+        assert_eq!(closed, id, "add_end closed the row add_start opened");
+
+        let conn = Connection::open(db.path()).unwrap();
+        let entry = get(&conn, id).unwrap().expect("row exists");
+        assert_eq!(entry.exit_code, Some(0));
+        assert_eq!(entry.duration_ms, Some(5_000)); // 5s → 5000ms
+    }
+
+    #[test]
+    fn add_end_without_matching_start_is_a_noop() {
+        let db = TempDb::new();
+        let store = Store::open(db.path()).unwrap();
+        // No add_start for this session → orphan add_end returns None.
+        assert_eq!(
+            store.add_end("ghost", 1, 1_700_000_000 * SEC_NS).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn add_start_skips_whitespace_prefixed_cmd() {
+        let db = TempDb::new();
+        let store = Store::open(db.path()).unwrap();
+        assert_eq!(
+            store
+                .add_start("  secret", "sess", 1_700_000_000 * SEC_NS, None, None, None)
+                .unwrap(),
+            None
+        );
     }
 
     #[test]

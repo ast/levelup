@@ -45,16 +45,19 @@ __munin_preexec() {
     else
         cmd="$BASH_COMMAND"
     fi
-    # ( cmd & ) detaches the child from this shell's job control so we don't
-    # see "Done" notifications; the outer redirect silences any incidentals.
-    ( command munin add-start -- "$cmd" "$MUNIN_SESSION" 2>/dev/null & ) >/dev/null 2>&1
+    # Capture runs SYNCHRONOUSLY (not detached). `munin` writes straight to
+    # SQLite and add-end pairs to the session's open row by SQL; backgrounding
+    # add-start/add-end could reorder them, so add-end would close the wrong
+    # command (scrambling exit codes) or a row would be lost on shell exit.
+    # Foreground keeps them ordered. Cost is ~5 ms per call; imperceptible.
+    command munin add-start -- "$cmd" "$MUNIN_SESSION" 2>/dev/null
 }
 
 __munin_precmd() {
     local rc=$?
     if [ "$_munin_active" -eq 1 ]; then
         _munin_active=0
-        ( command munin add-end -- "$MUNIN_SESSION" "$rc" 2>/dev/null & ) >/dev/null 2>&1
+        command munin add-end -- "$MUNIN_SESSION" "$rc" 2>/dev/null
     fi
     # Arm the DEBUG trap for the next command typed at the prompt.
     _munin_pending=1
