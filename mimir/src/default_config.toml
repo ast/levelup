@@ -1,0 +1,60 @@
+# mimir config — all keys optional; delete any you don't want to override.
+# Location: $XDG_CONFIG_HOME/mimir/config.toml
+
+interval_ms = 1000           # global refresh tick (ms)
+markup      = "pango"        # "pango" | "none"
+icons       = "nerdfont"     # "nerdfont" | "text"
+
+# Block render order, left → right. Names not listed are not shown.
+# ("power" = cpu governor/freq is available but off by default — add it to show it.)
+order = ["clock", "net", "disk", "memory", "load", "cpu", "thermal", "battery"]
+
+[clock]
+date_format = "%a %d %b"     # leading local date (chrono strftime; "" = none)
+time_format = "%H:%M"        # applied to every zone
+local_label = "LOC"
+# Extra labelled zones shown after local (IANA names):
+zones = [
+  { label = "UTC", tz = "UTC" },
+  { label = "NAT", tz = "America/Fortaleza" },  # Natal, RN — UTC-3, no DST
+]
+
+[cpu]
+warn = 80
+critical = 95
+
+[memory]
+warn = 80
+critical = 95
+
+[disk]
+mounts = [
+  { path = "/", warn = 85, critical = 95 },
+]
+
+[net]
+interfaces = []              # empty = auto-detect (first non-loopback iface)
+
+[thermal]
+hwmon_label = ""             # e.g. "coretemp" / "k10temp"; "" = first found
+warn = 75
+critical = 90
+
+[battery]
+warn = 20                    # warn/critical when capacity drops *below* these
+critical = 10
+
+# Cockpit palette (Airbus EFIS conventions). "" = swaybar default.
+[colors]
+label    = "#1ec8e6"         # cyan  — icons / labels / units
+data     = "#34d63a"         # green — normal live values
+time     = "#e8e8e8"         # white — the clock
+warn     = "#ffb000"         # amber — caution
+critical = "#ff3b30"         # red   — warning
+
+# Per-block click → command bindings.
+# button: 1=left 2=middle 3=right 4=scroll-up 5=scroll-down
+# bindings = [
+#   { block = "clock", button = 1, command = "gnome-calendar" },
+# ]
+bindings = []

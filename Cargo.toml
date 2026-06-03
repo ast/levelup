@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["hugin", "munin"]
+members = ["hugin", "munin", "mimir"]
 
 [workspace.package]
 version = "0.1.0"
@@ -24,6 +24,9 @@ ratatui = "0.29"
 crossterm = "0.28"
 toml = { version = "0.8", default-features = false, features = ["parse"] }
 nucleo-matcher = "0.3"
+nom = "8"
+chrono-tz = "0.10"
+nix = "0.29"
 
 [profile.release]
 lto = "thin"

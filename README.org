@@ -2,12 +2,13 @@
 #+author: Albin Stigö
 #+options: toc:nil num:nil
 
-A Rust workspace of two personal-computing tools:
+A Rust workspace of three personal-computing tools, named from Norse mythology:
 
 - *munin* — atuin-like shell-history search with an fzf-style TUI. Daemon + CLI + interactive picker, fuzzy matching via [[https://crates.io/crates/nucleo-matcher][nucleo-matcher]], SQLite storage.
 - *hugin* — Wayland clipboard manager for sway / wlroots compositors. Captures every selection change to a local SQLite DB, with fuzzy search and an interactive picker of its own.
+- *mimir* — a compact, interactive status bar for sway (an i3status replacement). Three clocks + power-user system metrics, read straight from =/proc= & =/sys=.
 
-Both crates target Rust 2024 (resolver 3), share workspace dependencies, and are built independently.
+All crates target Rust 2024 (resolver 3), share workspace dependencies, and are built independently.
 
 * Requirements
 
@@ -300,6 +301,86 @@ systemctl --user edit hugind.service
 
 =tracing= to stderr, gated by =HUGIN_LOG= (full =tracing-subscriber= EnvFilter syntax). One =INFO stored …= line per persisted capture; =DEBUG= for dedup hits and cleared selections.
 
+* mimir
+
+A compact, interactive status bar for sway — an =i3status= replacement. A single foreground process that swaybar spawns: it prints the swaybar/i3bar JSON protocol on stdout and reads click events on stdin. System state is read straight from =/proc= & =/sys= (parsed with [[https://crates.io/crates/nom][nom]]); the only other notable dependency is =chrono-tz= for named timezones. No daemon, no async runtime, no SQLite.
+
+Blocks shipped in v1: a three-zone clock (Local / UTC / Natal-Brazil), CPU%, load average, memory + swap, disk usage, network throughput + wifi signal, temperature, battery, and CPU governor/frequency. Each is coloured by configurable warn/critical thresholds (turning *urgent* past critical) and prefixed with a Nerd Font glyph.
+
+#+begin_example
+Tue 02 Jun · LOC 11:45 · UTC 09:45 · NAT 06:45    1.2K ↑256K  / 23%   5.2G/16G   0.93 1.77 1.80   12%   62°C   85%   powersave 2.4GHz
+#+end_example
+
+** Install
+
+#+begin_src sh
+cargo build --release -p mimir
+install -Dm755 target/release/mimir ~/.local/bin/mimir
+#+end_src
+
+A *Nerd Font* must be configured in your bar's font for the glyphs to render (or set =icons = "text"= in the config for ASCII labels).
+
+** Sway integration
+
+Point swaybar at =mimir= in =~/.config/sway/config=:
+
+#+begin_src
+bar {
+    status_command mimir
+    font pango:JetBrainsMono Nerd Font 10
+}
+#+end_src
+
+Reload sway (=$mod+Shift+c=). Click a block to interact:
+
+- *Left-click* expands a fuller view (CPU → per-core, memory → +swap, disk → free space, clock → seconds).
+- *Scroll* and other buttons are reserved for future per-block actions.
+- Bind a *command* to any (block, button) in the config (e.g. click the clock to open a calendar).
+
+** CLI
+
+| Subcommand            | What it does                                                            |
+|-----------------------+-------------------------------------------------------------------------|
+| =mimir=               | Run the bar (default).                                                   |
+| =mimir once=          | Print a single plain-text snapshot and exit — handy for debugging.       |
+| =mimir print-config=  | Emit the default =config.toml= (all keys documented).                   |
+| =mimir completions SHELL= | Print a shell-completion script.                                    |
+
+Pass =--config PATH= to override the config location.
+
+#+begin_src sh
+mimir once                 # one-line snapshot in a normal terminal
+mimir print-config > ~/.config/mimir/config.toml
+#+end_src
+
+** Config
+
+Optional TOML at =$XDG_CONFIG_HOME/mimir/config.toml=. All keys optional; a missing file or bad TOML falls back to defaults (the bar never refuses to start). Unknown keys are tolerated for forward-compatibility. Generate a fully-commented starting point with =mimir print-config=. Highlights:
+
+#+begin_src toml
+interval_ms = 1000           # global refresh tick
+icons       = "nerdfont"      # "nerdfont" | "text"
+order = ["clock", "net", "disk", "memory", "load", "cpu", "thermal", "battery", "power"]
+
+[clock]
+date_format = "%a %d %b"
+zones = [
+  { label = "UTC", tz = "UTC" },
+  { label = "NAT", tz = "America/Fortaleza" },  # Natal, RN — UTC-3, no DST
+]
+
+[[bindings]]                 # click the clock → open a calendar
+block = "clock"
+button = 1
+command = "gnome-calendar"
+#+end_src
+
+Thermal/CPU/memory/disk blocks each take =warn= / =critical= thresholds; the battery block reads them as "warn/critical when *below*". Colours are configurable under =[colors]=.
+
+** Logging
+
+=tracing= to stderr (stdout is the protocol and stays clean JSON), gated by =MIMIR_LOG= (full =tracing-subscriber= EnvFilter syntax). swaybar surfaces a status command's stderr in the sway log.
+
 * Development
 
 Run all commands from the workspace root:
@@ -315,6 +396,8 @@ cargo run --bin munind -p munin                       # run the munin daemon
 MUNIN_LOG=debug cargo run --bin munind -p munin       # verbose
 
 cargo run --bin hugind -p hugin                       # the hugin daemon
+
+cargo run -p mimir -- once                            # one-shot status snapshot
 #+end_src
 
 * Project layout
@@ -338,8 +421,16 @@ levelup/
 │       ├── proto.rs        # wire types
 │       ├── config.rs       # ~/.config/munin/config.toml
 │       └── shells/         # zsh.sh / bash.sh hook scripts
-└── hugin/
-    └── src/                # similar shape; see CLAUDE.md
+├── hugin/
+│   └── src/                # similar shape; see CLAUDE.md
+└── mimir/
+    └── src/
+        ├── main.rs         # CLI, render loop, stdin click thread
+        ├── protocol.rs     # swaybar/i3bar JSON (out) + click events (in)
+        ├── config.rs       # ~/.config/mimir/config.toml
+        ├── render.rs       # Segment → protocol block (colour/urgent/pango)
+        ├── blocks/         # clock, cpu, load, memory, disk, net, thermal, …
+        └── sys/            # /proc & /sys readers (nom parsers)
 #+end_src
 
 * License
