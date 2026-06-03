@@ -49,15 +49,73 @@ impl Selection {
     }
 }
 
+/// Default per-MIME-part size cap. Generous enough to keep 4K-screenshot PNGs
+/// and large text, tight enough to stub video-scale blobs. Override with
+/// `hugind --max-part-bytes`.
+pub const DEFAULT_MAX_PART_BYTES: usize = 16 * 1024 * 1024;
+
+/// How a captured MIME part was stored relative to the size cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartStore {
+    /// Stored in full (the part fit under the cap).
+    Full,
+    /// A text part that exceeded the cap: the leading `blob` prefix is stored
+    /// (UTF-8-boundary-snapped) and stays searchable; the rest is gone.
+    Truncated,
+    /// A binary part that exceeded the cap: no bytes kept (a truncated image
+    /// is useless), only the record that this MIME existed.
+    Omitted,
+}
+
+impl PartStore {
+    /// On-disk encoding for `mime_parts.truncated`.
+    pub fn as_i64(self) -> i64 {
+        match self {
+            PartStore::Full => 0,
+            PartStore::Truncated => 1,
+            PartStore::Omitted => 2,
+        }
+    }
+
+    pub fn from_i64(n: i64) -> Self {
+        match n {
+            1 => PartStore::Truncated,
+            2 => PartStore::Omitted,
+            _ => PartStore::Full,
+        }
+    }
+}
+
+/// One MIME part of a capture. `blob` holds the stored bytes — the full
+/// content, a truncated text prefix, or empty for an omitted oversized part.
+#[derive(Debug, Clone)]
+pub struct CapturedPart {
+    pub mime: String,
+    pub blob: Vec<u8>,
+    pub store: PartStore,
+}
+
+impl CapturedPart {
+    /// A fully-stored part (the common case, and the only kind produced when
+    /// re-serving a stored entry for `hugin copy`).
+    pub fn full(mime: String, blob: Vec<u8>) -> Self {
+        Self {
+            mime,
+            blob,
+            store: PartStore::Full,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CapturedEntry {
     pub ts_unix_ns: i64,
     pub selection: Selection,
-    pub parts: Vec<(String, Vec<u8>)>,
+    pub parts: Vec<CapturedPart>,
 }
 
 impl CapturedEntry {
-    pub fn now(selection: Selection, parts: Vec<(String, Vec<u8>)>) -> Self {
+    pub fn now(selection: Selection, parts: Vec<CapturedPart>) -> Self {
         let ts_unix_ns = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos() as i64)

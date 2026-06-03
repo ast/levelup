@@ -292,6 +292,13 @@ fn print_table(entries: &[EntryMeta]) {
         } else {
             label
         };
+        // Flag entries with a truncated/omitted part so it's clear why a
+        // `copy`/`get` might come back partial or empty.
+        let display = if e.oversized {
+            format!("⚠ {display}")
+        } else {
+            display
+        };
         println!(
             "{:<6} {:<19} {:<8} {:<9} {}",
             e.id,
@@ -308,9 +315,14 @@ fn print_info(e: &EntryMeta) {
     println!("time:      {}", fmt_ts(e.ts_unix_ns));
     println!("selection: {}", e.selection);
     println!(
-        "size:      {} bytes ({})",
+        "size:      {} bytes ({}){}",
         e.size_bytes,
-        human_size(e.size_bytes)
+        human_size(e.size_bytes),
+        if e.oversized {
+            "  ⚠ truncated/omitted (exceeded size cap; stored size is partial)"
+        } else {
+            ""
+        }
     );
     println!("mimes:");
     for m in &e.mimes {

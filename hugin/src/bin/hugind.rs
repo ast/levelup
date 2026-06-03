@@ -27,6 +27,7 @@ fn main() -> Result<()> {
     let db_path = args.db_path()?;
     let socket_path = args.socket_path();
     let watch_primary = args.primary;
+    let max_part_bytes = args.max_part_bytes;
 
     // Open the store synchronously so a schema-version mismatch aborts the
     // daemon with a clear error before anything else starts.
@@ -71,7 +72,7 @@ fn main() -> Result<()> {
     // No-op when NOTIFY_SOCKET isn't set (i.e. not run under systemd).
     let _ = sd_notify::notify(false, &[NotifyState::Ready]);
 
-    let dispatch_result = wayland::run(capture_tx, cmd_rx, watch_primary, shutdown);
+    let dispatch_result = wayland::run(capture_tx, cmd_rx, watch_primary, max_part_bytes, shutdown);
 
     drop(runtime);
     let _ = std::fs::remove_file(&socket_path);

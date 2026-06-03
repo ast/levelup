@@ -702,7 +702,9 @@ fn render_row(entry: &EntryMeta, match_fg: ratatui::style::Color) -> Line<'stati
         "C"
     };
     let size = human_size(entry.size_bytes);
-    let mut spans = vec![Span::raw(format!("{sel} {size:>7}  "))];
+    // Flag truncated/omitted entries so it's clear they may not paste back whole.
+    let mark = if entry.oversized { "⚠" } else { " " };
+    let mut spans = vec![Span::raw(format!("{sel}{mark}{size:>7}  "))];
     if let Some(snippet) = entry.snippet.as_deref() {
         spans.extend(highlight_snippet(snippet, match_fg));
     } else {

@@ -163,8 +163,21 @@ async fn dispatch<W: AsyncWriteExt + Unpin>(
             if let Some(m) = &mime {
                 parts.retain(|(part_mime, _)| part_mime == m);
                 if parts.is_empty() {
-                    return write_error(wr, format!("entry {id} has no MIME {m:?}")).await;
+                    return write_error(
+                        wr,
+                        format!("entry {id} has no re-copyable MIME {m:?} (oversized?)"),
+                    )
+                    .await;
                 }
+            }
+            // `load_parts` drops omitted (oversized) parts, so a pure stub
+            // comes back empty — nothing to put on the clipboard.
+            if parts.is_empty() {
+                return write_error(
+                    wr,
+                    format!("entry {id} has no re-copyable content (oversized; not stored)"),
+                )
+                .await;
             }
 
             let (reply_tx, reply_rx) = oneshot::channel();

@@ -32,6 +32,13 @@ pub struct DaemonArgs {
     #[arg(long)]
     pub primary: bool,
 
+    /// Maximum bytes stored per MIME part. Larger text parts keep a truncated
+    /// prefix; larger binary parts are stored as a metadata-only stub (the
+    /// entry still appears in history, just not re-pastable). Protects the
+    /// daemon from buffering huge clipboard payloads (e.g. a copied video).
+    #[arg(long, default_value_t = crate::DEFAULT_MAX_PART_BYTES)]
+    pub max_part_bytes: usize,
+
     /// Print a shell-completion script for SHELL to stdout and exit.
     #[arg(long, value_name = "SHELL", value_enum)]
     pub generate_completions: Option<Shell>,

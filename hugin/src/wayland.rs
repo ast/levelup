@@ -24,7 +24,7 @@ use wayland_protocols_wlr::data_control::v1::client::{
     zwlr_data_control_source_v1::{self, ZwlrDataControlSourceV1},
 };
 
-use crate::{CapturedEntry, Selection};
+use crate::{CapturedEntry, CapturedPart, PartStore, Selection, is_text_mime};
 
 /// MIME advertised by password managers (KeePassXC, Bitwarden, 1Password, …)
 /// to tell clipboard managers "this selection is a secret; do not persist it".
@@ -56,6 +56,9 @@ struct State {
     device: ZwlrDataControlDeviceV1,
     /// If false, primary-selection events are dropped without reading.
     watch_primary: bool,
+    /// Per-MIME-part size cap. Parts over this are truncated (text) or
+    /// omitted (binary) instead of buffered whole; see `read_offer`.
+    max_part_bytes: usize,
 }
 
 struct SourceData {
@@ -96,8 +99,9 @@ impl State {
         // and its content reads back as the literal "secret", skip the entire
         // offer before touching any of the (possibly sensitive) other MIMEs.
         if mimes.iter().any(|m| m == PASSWORD_HINT_MIME) {
-            match read_offer(&offer, PASSWORD_HINT_MIME, conn) {
-                Ok(bytes) if bytes.trim_ascii() == PASSWORD_HINT_VALUE => {
+            // The hint value is tiny; read it with the cap (it'll be `Full`).
+            match read_offer(&offer, PASSWORD_HINT_MIME, self.max_part_bytes, conn) {
+                Ok(OfferRead::Full(bytes)) if bytes.trim_ascii() == PASSWORD_HINT_VALUE => {
                     info!(
                         sel = sel.as_str(),
                         "skipping clipboard content marked as password-manager secret"
@@ -114,8 +118,39 @@ impl State {
 
         let mut parts = Vec::with_capacity(mimes.len());
         for mime in &mimes {
-            match read_offer(&offer, mime, conn) {
-                Ok(bytes) => parts.push((mime.clone(), bytes)),
+            match read_offer(&offer, mime, self.max_part_bytes, conn) {
+                Ok(OfferRead::Full(blob)) => parts.push(CapturedPart {
+                    mime: mime.clone(),
+                    blob,
+                    store: PartStore::Full,
+                }),
+                Ok(OfferRead::Truncated(blob)) => {
+                    info!(
+                        sel = sel.as_str(),
+                        %mime,
+                        cap = self.max_part_bytes,
+                        kept = blob.len(),
+                        "clipboard text part over cap; storing truncated prefix"
+                    );
+                    parts.push(CapturedPart {
+                        mime: mime.clone(),
+                        blob,
+                        store: PartStore::Truncated,
+                    });
+                }
+                Ok(OfferRead::Omitted) => {
+                    info!(
+                        sel = sel.as_str(),
+                        %mime,
+                        cap = self.max_part_bytes,
+                        "clipboard part over cap; storing metadata stub (no blob)"
+                    );
+                    parts.push(CapturedPart {
+                        mime: mime.clone(),
+                        blob: Vec::new(),
+                        store: PartStore::Omitted,
+                    });
+                }
                 Err(e) => warn!(sel = sel.as_str(), %mime, error = %e, "failed to read offer"),
             }
         }
@@ -182,7 +217,28 @@ impl State {
     }
 }
 
-fn read_offer(offer: &ZwlrDataControlOfferV1, mime: &str, conn: &Connection) -> Result<Vec<u8>> {
+/// Outcome of reading one MIME off an offer, relative to the size cap.
+enum OfferRead {
+    /// Read in full (fit under the cap).
+    Full(Vec<u8>),
+    /// Text MIME over the cap: leading prefix (UTF-8-boundary-snapped).
+    Truncated(Vec<u8>),
+    /// Binary MIME over the cap: bytes discarded, only the record kept.
+    Omitted,
+}
+
+/// Read a MIME from an offer, capped at `cap` bytes so a giant clipboard
+/// payload (a copied video, a huge image) can't be buffered whole on the
+/// wayland thread. We read at most `cap + 1` bytes: `<= cap` means EOF was
+/// reached (full content); `cap + 1` means there was more, so the part is
+/// over the cap — text keeps a boundary-snapped prefix, binary is omitted.
+/// Dropping the read fd early closes our pipe end (the source sees EPIPE).
+fn read_offer(
+    offer: &ZwlrDataControlOfferV1,
+    mime: &str,
+    cap: usize,
+    conn: &Connection,
+) -> Result<OfferRead> {
     let (read_fd, write_fd) = pipe2(OFlag::O_CLOEXEC).context("pipe2")?;
     offer.receive(mime.to_string(), write_fd.as_fd());
     drop(write_fd);
@@ -190,8 +246,34 @@ fn read_offer(offer: &ZwlrDataControlOfferV1, mime: &str, conn: &Connection) -> 
 
     let mut file: std::fs::File = read_fd.into();
     let mut buf = Vec::new();
-    file.read_to_end(&mut buf).context("read offer pipe")?;
-    Ok(buf)
+    // `cap + 1` is the over-the-line probe: if we manage to read it, there was
+    // at least one byte beyond the cap.
+    (&mut file)
+        .take(cap as u64 + 1)
+        .read_to_end(&mut buf)
+        .context("read offer pipe")?;
+
+    if buf.len() <= cap {
+        return Ok(OfferRead::Full(buf));
+    }
+    if is_text_mime(mime) {
+        buf.truncate(floor_char_boundary(&buf, cap));
+        Ok(OfferRead::Truncated(buf))
+    } else {
+        Ok(OfferRead::Omitted)
+    }
+}
+
+/// Largest index `<= idx` that isn't in the middle of a UTF-8 multi-byte
+/// sequence (so a stored text prefix doesn't end on a split codepoint).
+/// Steps back over continuation bytes (`0b10xxxxxx`); for non-UTF-8 text
+/// (e.g. Latin-1 `STRING` atoms) it may trim a few bytes, which is harmless.
+fn floor_char_boundary(buf: &[u8], idx: usize) -> usize {
+    let mut i = idx.min(buf.len());
+    while i > 0 && (buf[i] & 0xC0) == 0x80 {
+        i -= 1;
+    }
+    i
 }
 
 impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for State {
@@ -316,6 +398,7 @@ pub fn run(
     capture_tx: mpsc::Sender<CapturedEntry>,
     cmd_rx: CmdReceiver,
     watch_primary: bool,
+    max_part_bytes: usize,
     shutdown: Arc<AtomicBool>,
 ) -> Result<()> {
     let conn = Connection::connect_to_env().context("connect to wayland (WAYLAND_DISPLAY)")?;
@@ -338,8 +421,9 @@ pub fn run(
         manager,
         device,
         watch_primary,
+        max_part_bytes,
     };
-    info!(watch_primary, "watching clipboard");
+    info!(watch_primary, max_part_bytes, "watching clipboard");
 
     let wayland_fd = conn.as_fd();
 

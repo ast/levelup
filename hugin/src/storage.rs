@@ -9,7 +9,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use tracing::{debug, info, warn};
 
 use crate::proto::{EntryMeta, SearchSort};
-use crate::{CapturedEntry, is_text_mime};
+use crate::{CapturedEntry, CapturedPart, PartStore, is_text_mime};
 
 /// Schema version stored in `PRAGMA user_version`. Bump when the on-disk
 /// shape changes incompatibly; `Store::open` refuses to start on mismatch.
@@ -35,7 +35,8 @@ CREATE INDEX IF NOT EXISTS entries_sel_id_idx ON entries(selection, id);
 CREATE TABLE IF NOT EXISTS mime_parts (
     entry_id    INTEGER NOT NULL REFERENCES entries(id) ON DELETE CASCADE,
     mime        TEXT NOT NULL,
-    blob        BLOB NOT NULL,
+    blob        BLOB,
+    truncated   INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (entry_id, mime)
 );
 ";
@@ -135,18 +136,26 @@ impl Store {
     /// Returns the new row id, or `None` if the capture was a duplicate.
     pub fn insert(&mut self, entry: &CapturedEntry) -> Result<Option<i64>> {
         let hash = canonical_hash(&entry.parts);
-        let prev_hash: Option<Vec<u8>> = self
-            .conn
-            .query_row(
-                "SELECT hash FROM entries WHERE selection = ?1 ORDER BY id DESC LIMIT 1",
-                params![entry.selection.as_str()],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if prev_hash.as_deref() == Some(hash.as_bytes()) {
-            return Ok(None);
+        // Entries with an omitted part can't be deduped by content — their
+        // stored bytes are identical (none), so two distinct oversized copies
+        // would hash the same and the second would be dropped. Stubs are tiny,
+        // so we just skip the dedup check and always insert them.
+        let has_omitted = entry.parts.iter().any(|p| p.store == PartStore::Omitted);
+        if !has_omitted {
+            let prev_hash: Option<Vec<u8>> = self
+                .conn
+                .query_row(
+                    "SELECT hash FROM entries WHERE selection = ?1 ORDER BY id DESC LIMIT 1",
+                    params![entry.selection.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if prev_hash.as_deref() == Some(hash.as_bytes()) {
+                return Ok(None);
+            }
         }
-        let total_size: i64 = entry.parts.iter().map(|(_, b)| b.len() as i64).sum();
+        // Stored size = bytes we actually kept (omitted parts contribute 0).
+        let total_size: i64 = entry.parts.iter().map(|p| p.blob.len() as i64).sum();
         let indexable = pick_indexable_text(&entry.parts);
         let tx = self.conn.transaction()?;
         tx.execute(
@@ -162,10 +171,17 @@ impl Store {
         )?;
         let id = tx.last_insert_rowid();
         {
-            let mut stmt =
-                tx.prepare("INSERT INTO mime_parts (entry_id, mime, blob) VALUES (?1, ?2, ?3)")?;
-            for (mime, blob) in &entry.parts {
-                stmt.execute(params![id, mime, blob])?;
+            let mut stmt = tx.prepare(
+                "INSERT INTO mime_parts (entry_id, mime, blob, truncated) VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for part in &entry.parts {
+                // Omitted parts store a NULL blob — the row records that the
+                // MIME existed without keeping its (oversized) bytes.
+                let blob: Option<&[u8]> = match part.store {
+                    PartStore::Omitted => None,
+                    _ => Some(&part.blob),
+                };
+                stmt.execute(params![id, part.mime, blob, part.store.as_i64()])?;
             }
         }
         tx.commit()?;
@@ -227,15 +243,15 @@ fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
         .unwrap_or(false))
 }
 
-fn canonical_hash(parts: &[(String, Vec<u8>)]) -> blake3::Hash {
-    let mut sorted: Vec<&(String, Vec<u8>)> = parts.iter().collect();
-    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+fn canonical_hash(parts: &[CapturedPart]) -> blake3::Hash {
+    let mut sorted: Vec<&CapturedPart> = parts.iter().collect();
+    sorted.sort_by(|a, b| a.mime.cmp(&b.mime));
     let mut hasher = blake3::Hasher::new();
-    for (mime, blob) in sorted {
-        hasher.update(&(mime.len() as u32).to_le_bytes());
-        hasher.update(mime.as_bytes());
-        hasher.update(&(blob.len() as u64).to_le_bytes());
-        hasher.update(blob);
+    for part in sorted {
+        hasher.update(&(part.mime.len() as u32).to_le_bytes());
+        hasher.update(part.mime.as_bytes());
+        hasher.update(&(part.blob.len() as u64).to_le_bytes());
+        hasher.update(&part.blob);
     }
     hasher.finalize()
 }
@@ -248,10 +264,13 @@ fn canonical_hash(parts: &[(String, Vec<u8>)]) -> blake3::Hash {
 ///   1. any text-MIME via lossy decode (e.g. X11 STRING atoms shipping
 ///      Latin-1) — non-UTF-8 bytes become U+FFFD so the text is still
 ///      searchable rather than silently absent from the index.
-fn pick_indexable_text(parts: &[(String, Vec<u8>)]) -> Option<String> {
+fn pick_indexable_text(parts: &[CapturedPart]) -> Option<String> {
     let mut best: Option<(u8, String)> = None;
-    for (mime, blob) in parts {
-        if !is_text_mime(mime) {
+    for part in parts {
+        let (mime, blob) = (&part.mime, &part.blob);
+        // Omitted parts kept no bytes; a truncated text part keeps its prefix,
+        // which is still worth indexing.
+        if part.store == PartStore::Omitted || !is_text_mime(mime) {
             continue;
         }
         let base = mime.split(';').next().unwrap_or(mime).trim();
@@ -286,8 +305,8 @@ pub fn run_storage_thread(
     info!("storage ready");
     let _ = store.maybe_retain(&cfg);
     for entry in rx {
-        let mimes: Vec<&str> = entry.parts.iter().map(|(m, _)| m.as_str()).collect();
-        let total_size: usize = entry.parts.iter().map(|(_, b)| b.len()).sum();
+        let mimes: Vec<&str> = entry.parts.iter().map(|p| p.mime.as_str()).collect();
+        let total_size: usize = entry.parts.iter().map(|p| p.blob.len()).sum();
         match store.insert(&entry) {
             Ok(Some(id)) => info!(
                 id,
@@ -489,18 +508,26 @@ fn attach_mimes(conn: &Connection, rows: Vec<RowTuple>) -> Result<Vec<EntryMeta>
         .collect::<Vec<_>>()
         .join(",");
     let sql = format!(
-        "SELECT entry_id, mime FROM mime_parts \
+        "SELECT entry_id, mime, truncated FROM mime_parts \
          WHERE entry_id IN ({placeholders}) \
          ORDER BY entry_id, mime",
     );
     let mut stmt = conn.prepare(&sql)?;
-    let pairs = stmt.query_map(rusqlite::params_from_iter(ids.iter()), |row| {
-        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    let triples = stmt.query_map(rusqlite::params_from_iter(ids.iter()), |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
     })?;
     let mut mimes_by_id: HashMap<i64, Vec<String>> = HashMap::with_capacity(ids.len());
-    for pair in pairs {
-        let (id, mime) = pair?;
+    let mut oversized_by_id: HashMap<i64, bool> = HashMap::with_capacity(ids.len());
+    for triple in triples {
+        let (id, mime, truncated) = triple?;
         mimes_by_id.entry(id).or_default().push(mime);
+        // truncated != 0 → a part was truncated (text) or omitted (binary).
+        let flag = oversized_by_id.entry(id).or_insert(false);
+        *flag |= truncated != 0;
     }
     Ok(rows
         .into_iter()
@@ -512,6 +539,7 @@ fn attach_mimes(conn: &Connection, rows: Vec<RowTuple>) -> Result<Vec<EntryMeta>
                 mimes: mimes_by_id.remove(&id).unwrap_or_default(),
                 size_bytes,
                 snippet,
+                oversized: oversized_by_id.remove(&id).unwrap_or(false),
             },
         )
         .collect())
@@ -536,11 +564,14 @@ pub fn read_blob(
     id: i64,
     mime: Option<&str>,
 ) -> Result<Option<(String, Vec<u8>)>> {
+    // Only parts with a stored blob are servable — omitted (oversized) parts
+    // have a NULL blob and can't be re-copied.
     let chosen = match mime {
         Some(m) => m.to_string(),
         None => {
-            let mut stmt =
-                conn.prepare("SELECT mime FROM mime_parts WHERE entry_id = ?1 ORDER BY mime")?;
+            let mut stmt = conn.prepare(
+                "SELECT mime FROM mime_parts WHERE entry_id = ?1 AND blob IS NOT NULL ORDER BY mime",
+            )?;
             let mimes: Vec<String> = stmt
                 .query_map(params![id], |row| row.get::<_, String>(0))?
                 .collect::<rusqlite::Result<_>>()?;
@@ -558,7 +589,7 @@ pub fn read_blob(
 
     let blob: Option<Vec<u8>> = conn
         .query_row(
-            "SELECT blob FROM mime_parts WHERE entry_id = ?1 AND mime = ?2",
+            "SELECT blob FROM mime_parts WHERE entry_id = ?1 AND mime = ?2 AND blob IS NOT NULL",
             params![id, chosen],
             |row| row.get(0),
         )
@@ -566,9 +597,11 @@ pub fn read_blob(
     Ok(blob.map(|b| (chosen, b)))
 }
 
-/// Load every (mime, blob) pair for an entry. Returns `None` if the entry
-/// id does not exist. Used by `hugin copy` to repopulate the clipboard.
-pub fn load_parts(conn: &Connection, id: i64) -> Result<Option<Vec<MimePart>>> {
+/// Load every servable (mime, blob) pair for an entry. Omitted (oversized)
+/// parts have a NULL blob and are skipped — they can't be re-copied. Returns
+/// `None` if the entry id does not exist, or `Some(vec![])` if it exists but
+/// every part was omitted (a pure stub). Used by `hugin copy`.
+pub fn load_parts(conn: &Connection, id: i64) -> Result<Option<Vec<(String, Vec<u8>)>>> {
     let exists: i64 = conn.query_row(
         "SELECT COUNT(*) FROM entries WHERE id = ?1",
         params![id],
@@ -577,8 +610,9 @@ pub fn load_parts(conn: &Connection, id: i64) -> Result<Option<Vec<MimePart>>> {
     if exists == 0 {
         return Ok(None);
     }
-    let mut stmt =
-        conn.prepare("SELECT mime, blob FROM mime_parts WHERE entry_id = ?1 ORDER BY mime")?;
+    let mut stmt = conn.prepare(
+        "SELECT mime, blob FROM mime_parts WHERE entry_id = ?1 AND blob IS NOT NULL ORDER BY mime",
+    )?;
     let parts: Vec<(String, Vec<u8>)> = stmt
         .query_map(params![id], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
@@ -616,6 +650,7 @@ pub fn spawn_storage_thread(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Selection;
 
     /// Apply the live schema to an in-memory DB and insert a couple of
     /// entries directly (mirroring `Store::insert`) so we can exercise the
@@ -713,5 +748,114 @@ mod tests {
             Some("git commit -m")
         );
         assert_eq!(preview_text(&conn, 2, 100).unwrap(), None); // image: NULL text
+    }
+
+    /// Read-path behaviour for an entry whose oversized binary part was
+    /// omitted (NULL blob) and whose text part was truncated to a prefix.
+    #[test]
+    fn oversized_entry_reads_partial() {
+        let conn = seeded_conn();
+        // id 3: text/plain truncated (blob present, truncated=1) +
+        // image/png omitted (NULL blob, truncated=2).
+        conn.execute(
+            "INSERT INTO entries (id, ts_unix_ns, selection, hash, size_bytes, text)
+             VALUES (3, 300, 'regular', x'02', 5, 'hello')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO mime_parts (entry_id, mime, blob, truncated)
+             VALUES (3, 'text/plain', x'68656c6c6f', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO mime_parts (entry_id, mime, blob, truncated)
+             VALUES (3, 'image/png', NULL, 2)",
+            [],
+        )
+        .unwrap();
+
+        // list/get flag it oversized and still list both MIMEs.
+        let e = get(&conn, 3).unwrap().unwrap();
+        assert!(
+            e.oversized,
+            "entry with truncated/omitted part is oversized"
+        );
+        assert_eq!(e.mimes, vec!["image/png", "text/plain"]);
+
+        // The omitted image isn't servable; the truncated text is.
+        let parts = load_parts(&conn, 3).unwrap().unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].0, "text/plain");
+        assert!(read_blob(&conn, 3, Some("image/png")).unwrap().is_none());
+        assert_eq!(
+            read_blob(&conn, 3, None)
+                .unwrap()
+                .map(|(m, _)| m)
+                .as_deref(),
+            Some("text/plain")
+        );
+    }
+
+    fn temp_store() -> (Store, std::path::PathBuf) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "hugin-test-{}-{}.db",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&path);
+        (Store::open(&path).unwrap(), path)
+    }
+
+    /// Insert-path behaviour: a truncated text part keeps a searchable blob, an
+    /// omitted part writes a NULL blob, and an entry containing an omitted part
+    /// skips dedup (two identical stubs both persist).
+    #[test]
+    fn insert_truncated_and_omitted_parts() {
+        let (mut store, path) = temp_store();
+        let make = || {
+            CapturedEntry::now(
+                Selection::Regular,
+                vec![
+                    CapturedPart {
+                        mime: "text/plain".into(),
+                        blob: b"prefix".to_vec(),
+                        store: PartStore::Truncated,
+                    },
+                    CapturedPart {
+                        mime: "image/png".into(),
+                        blob: Vec::new(),
+                        store: PartStore::Omitted,
+                    },
+                ],
+            )
+        };
+        let id1 = store.insert(&make()).unwrap().expect("first insert");
+        // Same content again: an omitted part forces insert (no dedup).
+        let id2 = store.insert(&make()).unwrap().expect("stub is not deduped");
+        assert_ne!(id1, id2);
+
+        let conn = Connection::open(&path).unwrap();
+        // The text prefix is stored and indexed; the image blob is NULL.
+        assert_eq!(
+            preview_text(&conn, id1, 100).unwrap().as_deref(),
+            Some("prefix")
+        );
+        let img_blob: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT blob FROM mime_parts WHERE entry_id = ?1 AND mime = 'image/png'",
+                params![id1],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(img_blob.is_none(), "omitted part should store NULL blob");
+        // Searchable on the kept prefix.
+        let hits = search(&conn, "prefix", SearchSort::Relevance, 50, None).unwrap();
+        assert!(hits.iter().any(|e| e.id == id1 && e.oversized));
+
+        let _ = std::fs::remove_file(&path);
     }
 }

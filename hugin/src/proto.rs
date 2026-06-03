@@ -21,6 +21,11 @@ pub struct EntryMeta {
     /// with the nucleo-matched chars wrapped in `‹›`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snippet: Option<String>,
+    /// True if any MIME part was truncated or omitted because it exceeded the
+    /// daemon's size cap. Such an entry is preserved in history but may not be
+    /// fully (or at all) re-pastable; the CLI/TUI flag it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub oversized: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
