@@ -1,0 +1,25 @@
+[package]
+name = "heimdall"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "heimdall"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tokio = { workspace = true, features = ["time"] }
+serde.workspace = true
+rusqlite.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+toml.workspace = true
+nucleo-matcher.workspace = true
+if-addrs.workspace = true
+mac_oui.workspace = true
+mdns-sd.workspace = true
