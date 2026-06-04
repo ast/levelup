@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["hugin", "munin", "mimir", "sleipnir"]
+members = ["hugin", "munin", "mimir", "sleipnir", "valkyrie"]
 
 [workspace.package]
 version = "0.1.0"
