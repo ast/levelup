@@ -1,0 +1,23 @@
+[package]
+name = "sleipnir"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "sleipnir"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+rusqlite.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+toml.workspace = true
+nucleo-matcher.workspace = true
+shlex.workspace = true
+ignore.workspace = true

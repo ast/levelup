@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["hugin", "munin", "mimir"]
+members = ["hugin", "munin", "mimir", "sleipnir"]
 
 [workspace.package]
 version = "0.1.0"
@@ -27,6 +27,8 @@ nucleo-matcher = "0.3"
 nom = "8"
 chrono-tz = "0.10"
 nix = "0.29"
+shlex = "1"
+ignore = "0.4"
 
 [profile.release]
 lto = "thin"
