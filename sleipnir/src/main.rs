@@ -10,6 +10,7 @@
 //! - `sync` — force a file-pool refresh from munin (debugging).
 
 mod config;
+mod highlight;
 mod munin_import;
 mod shells;
 mod storage;

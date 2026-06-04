@@ -29,6 +29,9 @@ chrono-tz = "0.10"
 nix = "0.29"
 shlex = "1"
 ignore = "0.4"
+# Pure-Rust regex (fancy-regex) so there's no oniguruma C build; the embedded
+# syntax/theme dumps load lazily (~23ms once) and add ~200KB.
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 
 [profile.release]
 lto = "thin"

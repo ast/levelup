@@ -6,6 +6,7 @@
 //! (`storage::Row` with a `Kind`), the dir/file signifier, a preview pane, and
 //! the richer action contract (cd vs insert, by row type).
 
+use std::cell::OnceCell;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -28,6 +29,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 
 use crate::config::{Config, Layout};
+use crate::highlight::Highlighter;
 use crate::storage::{self, Kind, Row};
 use crate::util::sanitize_display;
 
@@ -61,6 +63,9 @@ struct State {
     pool: Vec<Row>,
     results: Vec<Row>,
     list_state: ListState,
+    /// Syntax highlighter for file previews, built lazily on first file preview
+    /// (so the ~23ms syntect load never blocks startup or affects typing).
+    highlighter: OnceCell<Highlighter>,
 }
 
 impl State {
@@ -97,6 +102,7 @@ fn run_loop(
         pool,
         results: Vec::new(),
         list_state: ListState::default(),
+        highlighter: OnceCell::new(),
     };
     refresh_results(&mut state, cfg);
 
@@ -508,12 +514,22 @@ fn render_preview(f: &mut ratatui::Frame<'_>, state: &State, cfg: &Config, area:
     };
     let max_rows = inner.height as usize;
     let lines: Vec<Line> = match row.kind {
-        Kind::Dir => preview_dir(&row.path, max_rows),
-        Kind::File => preview_file(&row.path, max_rows),
-    }
-    .into_iter()
-    .map(|s| Line::from(sanitize_display(&s)))
-    .collect();
+        Kind::Dir => preview_dir(&row.path, max_rows)
+            .into_iter()
+            .map(|s| Line::from(sanitize_display(&s)))
+            .collect(),
+        Kind::File => {
+            let raw = preview_file(&row.path, max_rows);
+            // Lazily build the highlighter on the first file preview, then reuse
+            // it for the session. Unknown languages fall back to plain text.
+            let hl = state.highlighter.get_or_init(Highlighter::new);
+            hl.highlight(&row.path, &raw).unwrap_or_else(|| {
+                raw.into_iter()
+                    .map(|s| Line::from(sanitize_display(&s)))
+                    .collect()
+            })
+        }
+    };
     f.render_widget(Paragraph::new(lines), inner);
 }
 

@@ -21,3 +21,4 @@ toml.workspace = true
 nucleo-matcher.workspace = true
 shlex.workspace = true
 ignore.workspace = true
+syntect.workspace = true
