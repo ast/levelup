@@ -2,11 +2,16 @@
 #+author: Albin Stigö
 #+options: toc:nil num:nil
 
-A Rust workspace of three personal-computing tools, named from Norse mythology:
+A Rust workspace of six personal-computing tools, named from Norse mythology:
 
 - *munin* — atuin-like shell-history search with an fzf-style TUI. Daemon + CLI + interactive picker, fuzzy matching via [[https://crates.io/crates/nucleo-matcher][nucleo-matcher]], SQLite storage.
 - *hugin* — Wayland clipboard manager for sway / wlroots compositors. Captures every selection change to a local SQLite DB, with fuzzy search and an interactive picker of its own.
 - *mimir* — a compact, interactive status bar for sway (an i3status replacement). Three clocks + power-user system metrics, read straight from =/proc= & =/sys=.
+- *sleipnir* — a modeless frecency navigator. Fuses fzf's file-finder, jump-to-folder, and =z= into one Ctrl-T picker over the directories *and* files you actually use.
+- *valkyrie* — a modeless, humane process finder/handler. Alt-P opens a live picker; type to filter (incl. =:port=), act with graceful-first signals.
+- *heimdall* — a rootless LAN device finder. Who's on your network right now, via ARP-sweep + mDNS + SSDP + OUI, all in user space (no root).
+
+The five interactive pickers (munin, hugin, sleipnir, valkyrie, heimdall) share one design language: a modeless fuzzy search over a single content space (type to narrow everything at once), fzf-style layout with the prompt on the bottom row, =‹match›= highlighting in the match colour, and a readline/Emacs editing keymap. Built in the spirit of Jef Raskin's *Humane Interface* and Don Norman's *Design of Everyday Things*.
 
 All crates target Rust 2024 (resolver 3), share workspace dependencies, and are built independently.
 
@@ -381,6 +386,98 @@ Thermal/CPU/memory/disk blocks each take =warn= / =critical= thresholds; the bat
 
 =tracing= to stderr (stdout is the protocol and stays clean JSON), gated by =MIMIR_LOG= (full =tracing-subscriber= EnvFilter syntax). swaybar surfaces a status command's stderr in the sway log.
 
+* sleipnir
+
+A modeless frecency navigator that collapses three tools — fzf's file-finder, fzf's jump-to-folder, and =z= — into one =Ctrl-T= picker over a single list fusing the directories *and* files you actually touch.
+
+** Install
+
+#+begin_src sh
+cargo build --release -p sleipnir
+install -Dm755 target/release/sleipnir ~/.local/bin/sleipnir
+#+end_src
+
+** Shell setup
+
+Add to =~/.zshrc=:
+
+#+begin_src sh
+eval "$(sleipnir init zsh)"
+#+end_src
+
+This adds a =chpwd= hook (records every directory you visit) and binds *Ctrl-T* to the picker.
+
+** How it works
+
+- *Directories* are ranked by frecency (frequency × recency, zoxide's decay curve) from the chpwd hook.
+- *Files* come from two fused sources: a live, =.gitignore=-aware walk of the enclosing git repo (ranked by modification time, so a file you only edited in your editor still appears), and your *munin* command history (files you've named as arguments — so it ranks what you actually open). munin is optional; without it you still get the walk + dirs.
+
+One modeless list — type and *everything* narrows at once. *Enter* on a directory =cd='s there; *Enter* on a file inserts its path on the command line; *Tab* is the inverse (file → its parent dir, dir → insert as an argument). A right-side preview pane shows a directory listing or a syntax-highlighted file head.
+
+Storage at =$XDG_DATA_HOME/sleipnir/sleipnir.db=; config at =$XDG_CONFIG_HOME/sleipnir/config.toml= (=layout=, =preview=, and =[colors]= incl. =dir_fg= / =file_fg=).
+
+* valkyrie
+
+A modeless, humane process finder/handler — htop's reach without the modes. *Alt-P* opens a live picker over running processes (sorted by %CPU).
+
+** Install
+
+#+begin_src sh
+cargo build --release -p valkyrie
+install -Dm755 target/release/valkyrie ~/.local/bin/valkyrie
+eval "$(valkyrie init zsh)"   # in ~/.zshrc: binds Alt-P, adds the `vk` alias
+#+end_src
+
+** Keys
+
+Type to filter across name / cmdline / PID / user / *=:port=* in one search (=:3000= finds whatever's listening there). Letters feed the query, so every action is a Ctrl/Tab key:
+
+| Key              | Action                                                          |
+|------------------+----------------------------------------------------------------|
+| =Enter=          | SIGTERM (graceful)                                             |
+| *hold =Alt-K=*   | SIGKILL — a meter fills while held; release cancels            |
+| =Ctrl-Z=         | SIGSTOP / SIGCONT toggle (pause / resume)                      |
+| =Tab=            | signal chooser (curated set + type any name/number)            |
+| =Ctrl-T=         | process *tree* — homogeneous broods (firefox ×12) auto-collapse |
+| =Ctrl-O=         | scope: all ↔ mine                                             |
+| =Ctrl-R=         | sort: cpu / mem / pid                                          |
+| =Ctrl-V=         | toggle the detail strip                                        |
+| =Esc= / =Ctrl-C= | quit                                                          |
+
+The irreversible kill is gated behind a sustained physical gesture, never a yes/no dialog (Raskin). A horizontal detail strip shows the selected process's exe/cwd/ports/threads plus a calm aggregate CPU + load line. Reads =/proc= directly; no daemon, no storage.
+
+* heimdall
+
+A rootless LAN device finder — the all-seeing watchman. Discovers everything on your local network *in user space* (no root, no raw sockets) by combining a TCP/UDP subnet sweep that provokes the kernel's ARP cache with *mDNS* and *SSDP* multicast, plus an OUI vendor lookup.
+
+** Install
+
+#+begin_src sh
+cargo build --release -p heimdall
+install -Dm755 target/release/heimdall ~/.local/bin/heimdall
+#+end_src
+
+** Usage
+
+#+begin_src sh
+heimdall          # the live interactive picker
+heimdall scan     # one-shot, non-interactive dump (IP / MAC / vendor / host / services)
+heimdall init     # print a shell alias (`ht`)
+#+end_src
+
+The picker is *presence-first* — it shows who's reachable *right now*. Devices fill in live (names resolve asynchronously via mDNS/SSDP), each shows its last-seen age and *dims when it goes quiet*, dropping after a timeout. Type to fuzzy-filter across IP / MAC / vendor / hostname / service. A horizontal detail strip shows the selected device.
+
+Actions on the selected device:
+
+- *Enter* → open =http://IP= in your browser (=xdg-open=).
+- *Ctrl-S* → ssh to it (suspends the picker, runs ssh, returns).
+- *Ctrl-Y* → copy the IP to the clipboard (=wl-copy= / =xclip=).
+- *Tab* → on-demand TCP port scan.
+
+A small MAC-keyed cache at =$XDG_CACHE_HOME/heimdall/devices.db= makes relaunch instant (last-known devices show immediately, then confirm or drop by reachability). Config at =$XDG_CONFIG_HOME/heimdall/config.toml=.
+
+*Rootless caveat:* a device that ignores TCP, advertises nothing on mDNS/SSDP, and isn't in the ARP cache won't appear — that's the price of running without raw sockets.
+
 * Development
 
 Run all commands from the workspace root:
@@ -423,18 +520,26 @@ levelup/
 │       └── shells/         # zsh.sh / bash.sh hook scripts
 ├── hugin/
 │   └── src/                # similar shape; see CLAUDE.md
-└── mimir/
+├── mimir/
+│   └── src/
+│       ├── main.rs         # CLI, render loop, stdin click thread
+│       ├── protocol.rs     # swaybar/i3bar JSON (out) + click events (in)
+│       ├── config.rs       # ~/.config/mimir/config.toml
+│       ├── render.rs       # Segment → protocol block (colour/urgent/pango)
+│       ├── blocks/         # clock, cpu, load, memory, disk, net, thermal, …
+│       └── sys/            # /proc & /sys readers (nom parsers)
+├── sleipnir/
+│   └── src/                # storage.rs (frecency), munin_import.rs, walk.rs, tui.rs (Ctrl-T)
+├── valkyrie/
+│   └── src/                # proc.rs (/proc), signals.rs, tree.rs, tui.rs (Alt-P)
+└── heimdall/
     └── src/
-        ├── main.rs         # CLI, render loop, stdin click thread
-        ├── protocol.rs     # swaybar/i3bar JSON (out) + click events (in)
-        ├── config.rs       # ~/.config/mimir/config.toml
-        ├── render.rs       # Segment → protocol block (colour/urgent/pango)
-        ├── blocks/         # clock, cpu, load, memory, disk, net, thermal, …
-        └── sys/            # /proc & /sys readers (nom parsers)
+        ├── discover/       # subnet, arp, mdns, ssdp, oui, engine (rootless)
+        ├── device.rs       # the device model
+        ├── cache.rs        # MAC-keyed speed cache
+        └── tui.rs          # live device picker + actions
 #+end_src
 
 * License
 
 MIT. See [[file:LICENSE][LICENSE]].
-</content>
-</invoke>
