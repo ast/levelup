@@ -15,17 +15,16 @@ mod shells;
 mod signals;
 mod tree;
 mod tui;
-mod util;
 
 use std::time::Duration;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use levelup_core::sanitize_display;
 
 use crate::proc::Scanner;
 use crate::search::{Sort, rank};
 use crate::shells::Shell;
-use crate::util::sanitize_display;
 
 /// `"<pkgver> (<git-commit>)"` — the git commit is embedded by `build.rs`.
 const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_COMMIT"), ")");
@@ -66,7 +65,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::List { query, limit } => {
-            util::init_tracing();
+            levelup_core::init_tracing("VALKYRIE_LOG");
             run_list(&query.join(" "), limit)
         }
         Cmd::Pick { query } => {

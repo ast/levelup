@@ -107,7 +107,7 @@ impl Store {
         // Version check runs before pragmas: WAL leaves -wal/-shm sidecars on
         // disk, and we don't want to scatter them around a DB we're about to
         // refuse.
-        ensure_compatible_schema(&conn, path)?;
+        levelup_core::sqlite::ensure_compatible_schema(&conn, path, DB_VERSION, "entries")?;
         // `busy_timeout` matters now that captures write directly from the CLI:
         // a `munin add-start` and a concurrent daemon `import` (or two shells)
         // can contend for the single WAL writer, and we want the loser to wait
@@ -344,23 +344,6 @@ fn ensure_client_id(conn: &Connection) -> Result<String> {
     Ok(id)
 }
 
-/// Refuse to open a database produced by a different schema generation.
-/// Fresh DBs (no `entries` table yet) pass through unconditionally.
-fn ensure_compatible_schema(conn: &Connection, path: &Path) -> Result<()> {
-    let version: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    if version == DB_VERSION {
-        return Ok(());
-    }
-    if version == 0 && !table_exists(conn, "entries")? {
-        return Ok(());
-    }
-    bail!(
-        "incompatible munin database at {}: schema v{version}, daemon expects v{DB_VERSION}. \
-         No automatic migration; delete the file and restart to recreate.",
-        path.display(),
-    );
-}
-
 /// Build a UUIDv7 whose embedded timestamp is `ts_unix_ns` (instead of the
 /// wall-clock-now used by `Uuid::now_v7()`). Used by `import_file` so the
 /// imported row's uuid sorts next to live captures from the same era.
@@ -373,23 +356,8 @@ fn uuid_for_ts(ts_unix_ns: i64) -> Uuid {
     Uuid::new_v7(Timestamp::from_unix(NoContext, secs, subsec_nanos))
 }
 
-fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
-    Ok(conn
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type IN ('table','view') AND name = ?1",
-            params![name],
-            |_| Ok(true),
-        )
-        .optional()?
-        .unwrap_or(false))
-}
-
 pub fn default_db_path() -> Result<PathBuf> {
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
-        .context("neither XDG_DATA_HOME nor HOME is set")?;
-    Ok(base.join("munin").join("munin.db"))
+    levelup_core::xdg::data_file("munin", "munin.db")
 }
 
 pub fn run_storage_thread(mut store: Store, rx: mpsc::Receiver<StoreCmd>) {
@@ -473,12 +441,8 @@ pub fn search(
     // by MAX_LIMIT so we don't blow up on huge DBs.
     let pool = list(conn, MAX_LIMIT, filters)?;
 
-    let mut matcher = nucleo_matcher::Matcher::new(nucleo_matcher::Config::DEFAULT);
-    let pattern = nucleo_matcher::pattern::Pattern::parse(
-        trimmed,
-        nucleo_matcher::pattern::CaseMatching::Smart,
-        nucleo_matcher::pattern::Normalization::Smart,
-    );
+    let mut matcher = levelup_core::fuzzy::matcher();
+    let pattern = levelup_core::fuzzy::pattern(trimmed);
 
     let mut hay_buf = Vec::new();
     let mut idx_buf = Vec::new();
@@ -490,7 +454,7 @@ pub fn search(
             // nucleo doesn't guarantee sorted indices; sort once before we
             // walk them in highlight_indices.
             idx_buf.sort_unstable();
-            entry.snippet = Some(highlight_indices(&entry.cmd, &idx_buf));
+            entry.snippet = Some(levelup_core::fuzzy::highlight_indices(&entry.cmd, &idx_buf));
             scored.push((score, entry));
         }
     }
@@ -507,36 +471,6 @@ pub fn search(
 
     let limit = limit.min(MAX_LIMIT);
     Ok(scored.into_iter().take(limit).map(|(_, e)| e).collect())
-}
-
-/// Walk `s` codepoint by codepoint; wrap runs of matched positions
-/// (`indices`, sorted ascending) in `‹…›`. The TUI's `highlight_snippet`
-/// parses these markers to colour the matched runs.
-fn highlight_indices(s: &str, indices: &[u32]) -> String {
-    let mut out = String::with_capacity(s.len() + indices.len() * 4);
-    let mut idx_iter = indices.iter().copied().peekable();
-    let mut in_match = false;
-    for (i, c) in s.chars().enumerate() {
-        let is_match = idx_iter.peek() == Some(&(i as u32));
-        if is_match {
-            if !in_match {
-                out.push('‹');
-                in_match = true;
-            }
-            out.push(c);
-            idx_iter.next();
-        } else {
-            if in_match {
-                out.push('›');
-                in_match = false;
-            }
-            out.push(c);
-        }
-    }
-    if in_match {
-        out.push('›');
-    }
-    out
 }
 
 pub fn get(conn: &Connection, id: i64) -> Result<Option<EntryMeta>> {
@@ -799,14 +733,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn highlight_wraps_contiguous_and_split_runs() {
-        // Contiguous match run gets one ‹…› pair.
-        assert_eq!(highlight_indices("git commit", &[0, 1, 2]), "‹git› commit");
-        // Two separate runs → two pairs.
-        assert_eq!(highlight_indices("abcd", &[0, 2]), "‹a›b‹c›d");
-    }
-
     /// A temp SQLite path that removes the db and its `-wal`/`-shm` sidecars
     /// on drop.
     struct TempDb(PathBuf);
@@ -886,12 +812,5 @@ mod tests {
                 .unwrap(),
             None
         );
-    }
-
-    #[test]
-    fn highlight_is_multibyte_safe() {
-        // Index 3 is the multi-byte 'é'; markers must land on the char, not
-        // split its bytes (the function walks chars().enumerate()).
-        assert_eq!(highlight_indices("café x", &[3]), "caf‹é› x");
     }
 }

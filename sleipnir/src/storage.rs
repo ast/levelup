@@ -10,7 +10,7 @@
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::util::{abbrev_home, home_dir};
@@ -71,7 +71,7 @@ pub fn open(path: &Path) -> Result<Connection> {
     let mut conn = Connection::open(path).with_context(|| format!("open db {path:?}"))?;
     // Version check runs before pragmas so a rejected DB doesn't leave
     // -wal/-shm sidecars scattered around.
-    ensure_compatible_schema(&conn, path)?;
+    levelup_core::sqlite::ensure_compatible_schema(&conn, path, DB_VERSION, "dirs")?;
     conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;")
         .context("set pragmas")?;
     // Schema apply + version stamp must be atomic (a crash between them would
@@ -82,32 +82,6 @@ pub fn open(path: &Path) -> Result<Connection> {
         .context("set schema version")?;
     tx.commit().context("commit schema tx")?;
     Ok(conn)
-}
-
-fn ensure_compatible_schema(conn: &Connection, path: &Path) -> Result<()> {
-    let version: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    if version == DB_VERSION {
-        return Ok(());
-    }
-    if version == 0 && !table_exists(conn, "dirs")? {
-        return Ok(());
-    }
-    bail!(
-        "incompatible sleipnir database at {}: schema v{version}, expected v{DB_VERSION}. \
-         No automatic migration; delete the file and restart to recreate.",
-        path.display(),
-    );
-}
-
-fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
-    Ok(conn
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type IN ('table','view') AND name = ?1",
-            params![name],
-            |_| Ok(true),
-        )
-        .optional()?
-        .unwrap_or(false))
 }
 
 /// Record a directory visit. First visit seeds rank 1; later visits bump it
@@ -227,12 +201,8 @@ pub fn rank_pool(mut pool: Vec<Row>, query: &str) -> Vec<Row> {
         return pool;
     }
 
-    let mut matcher = nucleo_matcher::Matcher::new(nucleo_matcher::Config::DEFAULT);
-    let pattern = nucleo_matcher::pattern::Pattern::parse(
-        trimmed,
-        nucleo_matcher::pattern::CaseMatching::Smart,
-        nucleo_matcher::pattern::Normalization::Smart,
-    );
+    let mut matcher = levelup_core::fuzzy::matcher();
+    let pattern = levelup_core::fuzzy::pattern(trimmed);
 
     let mut hay_buf = Vec::new();
     let mut idx_buf = Vec::new();
@@ -242,7 +212,10 @@ pub fn rank_pool(mut pool: Vec<Row>, query: &str) -> Vec<Row> {
         let haystack = nucleo_matcher::Utf32Str::new(&row.display, &mut hay_buf);
         if let Some(score) = pattern.indices(haystack, &mut matcher, &mut idx_buf) {
             idx_buf.sort_unstable();
-            row.snippet = Some(highlight_indices(&row.display, &idx_buf));
+            row.snippet = Some(levelup_core::fuzzy::highlight_indices(
+                &row.display,
+                &idx_buf,
+            ));
             scored.push((score, row));
         }
     }
@@ -255,37 +228,6 @@ pub fn rank_pool(mut pool: Vec<Row>, query: &str) -> Vec<Row> {
         })
     });
     scored.into_iter().map(|(_, r)| r).collect()
-}
-
-/// Walk `s` codepoint by codepoint, wrapping runs of matched positions
-/// (`indices`, sorted ascending) in `‹…›`. Same marker convention as munin —
-/// the TUI's `highlight_snippet` parses these to colour matched runs. Iterates
-/// `chars().enumerate()` so multi-byte chars don't shift the markers.
-pub fn highlight_indices(s: &str, indices: &[u32]) -> String {
-    let mut out = String::with_capacity(s.len() + indices.len() * 4);
-    let mut idx_iter = indices.iter().copied().peekable();
-    let mut in_match = false;
-    for (i, c) in s.chars().enumerate() {
-        let is_match = idx_iter.peek() == Some(&(i as u32));
-        if is_match {
-            if !in_match {
-                out.push('‹');
-                in_match = true;
-            }
-            out.push(c);
-            idx_iter.next();
-        } else {
-            if in_match {
-                out.push('›');
-                in_match = false;
-            }
-            out.push(c);
-        }
-    }
-    if in_match {
-        out.push('›');
-    }
-    out
 }
 
 /// Housekeeping run from the (TTL-gated) file sync, off the `pick` hot path:
@@ -331,14 +273,9 @@ pub fn set_meta(conn: &Connection, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-/// Default DB path: `$XDG_DATA_HOME/sleipnir/sleipnir.db`, falling back to
-/// `$HOME/.local/share/sleipnir/sleipnir.db`.
+/// Default DB path: `$XDG_DATA_HOME/sleipnir/sleipnir.db`.
 pub fn default_db_path() -> Result<PathBuf> {
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
-        .context("neither XDG_DATA_HOME nor HOME is set")?;
-    Ok(base.join("sleipnir").join("sleipnir.db"))
+    levelup_core::xdg::data_file("sleipnir", "sleipnir.db")
 }
 
 #[cfg(test)]
@@ -438,11 +375,5 @@ mod tests {
         let ranked = rank_pool(pool, "levelup");
         assert_eq!(ranked.len(), 1, "non-matching row dropped");
         assert!(ranked[0].snippet.as_deref().unwrap().contains('‹'));
-    }
-
-    #[test]
-    fn highlight_wraps_runs() {
-        assert_eq!(highlight_indices("abcd", &[0, 2]), "‹a›b‹c›d");
-        assert_eq!(highlight_indices("café x", &[3]), "caf‹é› x");
     }
 }

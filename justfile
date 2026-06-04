@@ -28,6 +28,40 @@ fmt:
 fmt-check:
     cargo fmt --all -- --check
 
+# --- munin ---
+
+# Run the munin CLI (forward args after `--`, e.g. `just munin -- search foo`)
+munin *ARGS:
+    cargo run --quiet --bin munin -p munin -- {{ARGS}}
+
+# Run the munind daemon. MUNIN_LOG controls log level.
+munind:
+    cargo run --bin munind -p munin
+
+# --- mimir ---
+
+# Run the mimir status bar (forward args after `--`)
+mimir *ARGS:
+    cargo run --quiet -p mimir -- {{ARGS}}
+
+# --- sleipnir ---
+
+# Run the sleipnir frecency navigator (forward args after `--`, e.g. `just sleipnir -- query`)
+sleipnir *ARGS:
+    cargo run --quiet -p sleipnir -- {{ARGS}}
+
+# --- valkyrie ---
+
+# Run the valkyrie process finder (forward args after `--`, e.g. `just valkyrie -- list`)
+valkyrie *ARGS:
+    cargo run --quiet -p valkyrie -- {{ARGS}}
+
+# --- heimdall ---
+
+# Run the heimdall LAN device finder (forward args after `--`, e.g. `just heimdall -- scan`)
+heimdall *ARGS:
+    cargo run --quiet -p heimdall -- {{ARGS}}
+
 # --- hugin ---
 
 # Run hugind against your real database. HUGIN_LOG controls log level.

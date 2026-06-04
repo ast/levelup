@@ -9,18 +9,14 @@
 
 use std::collections::HashSet;
 use std::fs::File;
-use std::io::Write;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
-use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers,
-};
-use crossterm::execute;
-use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-};
+use anyhow::Result;
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use levelup_core::sanitize_display;
+use levelup_tui::editing;
+use levelup_tui::highlight::highlight_snippet;
+use levelup_tui::terminal;
 use nix::sys::signal::Signal;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -34,7 +30,6 @@ use crate::proc::{Process, Scanner, current_uid, load_avg};
 use crate::search::{Sort, rank};
 use crate::signals::{self, CURATED, SendResult};
 use crate::tree::{self, TreeMeta};
-use crate::util::sanitize_display;
 
 /// Key/timer poll granularity. Short enough that the hold-to-kill meter and the
 /// rescan feel responsive.
@@ -53,9 +48,9 @@ const DETAIL_HEIGHT: u16 = 5;
 
 pub fn run(initial_query: String) -> Result<()> {
     let cfg = config::load_or_default();
-    let mut term = setup_terminal()?;
+    let mut term = terminal::setup()?;
     let result = run_loop(&mut term, initial_query, &cfg);
-    restore_terminal(&mut term).ok();
+    terminal::restore(&mut term).ok();
     result
 }
 
@@ -468,45 +463,25 @@ fn chooser_items(query: &str) -> Vec<(Signal, String)> {
 // ---- query editing helpers (from sleipnir) --------------------------------
 
 fn prev_off(s: &str, pos: usize) -> usize {
-    s[..pos]
-        .chars()
-        .next_back()
-        .map_or(0, |c| pos - c.len_utf8())
+    editing::prev_offset(s, pos)
 }
 fn next_off(s: &str, pos: usize) -> usize {
-    s[pos..]
-        .chars()
-        .next()
-        .map_or(s.len(), |c| pos + c.len_utf8())
+    editing::next_offset(s, pos)
 }
 fn delete_back(state: &mut State, cfg: &Config) {
-    if state.cursor == 0 {
-        return;
+    if editing::delete_back(&mut state.query, &mut state.cursor) {
+        state.refresh_results(cfg);
     }
-    let prev = prev_off(&state.query, state.cursor);
-    state.query.replace_range(prev..state.cursor, "");
-    state.cursor = prev;
-    state.refresh_results(cfg);
 }
 fn kill_to_end(state: &mut State, cfg: &Config) {
-    if state.cursor >= state.query.len() {
-        return;
+    if editing::kill_to_end(&mut state.query, &mut state.cursor) {
+        state.refresh_results(cfg);
     }
-    state.query.truncate(state.cursor);
-    state.refresh_results(cfg);
 }
 fn delete_word(state: &mut State, cfg: &Config) {
-    if state.cursor == 0 {
-        return;
+    if editing::delete_word(&mut state.query, &mut state.cursor) {
+        state.refresh_results(cfg);
     }
-    let trimmed = state.query[..state.cursor].trim_end();
-    let start = trimmed
-        .rfind(char::is_whitespace)
-        .map(|i| i + 1)
-        .unwrap_or(0);
-    state.query.replace_range(start..state.cursor, "");
-    state.cursor = start;
-    state.refresh_results(cfg);
 }
 
 // ---- rendering ------------------------------------------------------------
@@ -626,43 +601,10 @@ fn render_row(
         }
     }
     match p.snippet.as_deref() {
-        Some(snip) => spans.extend(highlight_snippet(snip, match_fg)),
+        Some(snip) => spans.extend(highlight_snippet(snip, match_fg, Color::Reset)),
         None => spans.push(Span::raw(sanitize_display(&p.command))),
     }
     Line::from(spans)
-}
-
-fn highlight_snippet(s: &str, match_fg: Color) -> Vec<Span<'static>> {
-    let s = sanitize_display(s);
-    let mut spans = Vec::new();
-    let mut buf = String::new();
-    let mut in_match = false;
-    let matched = Style::default().fg(match_fg).add_modifier(Modifier::BOLD);
-    for ch in s.chars() {
-        match ch {
-            '‹' => {
-                if !buf.is_empty() {
-                    spans.push(Span::raw(std::mem::take(&mut buf)));
-                }
-                in_match = true;
-            }
-            '›' => {
-                if !buf.is_empty() {
-                    spans.push(Span::styled(std::mem::take(&mut buf), matched));
-                }
-                in_match = false;
-            }
-            c => buf.push(c),
-        }
-    }
-    if !buf.is_empty() {
-        if in_match {
-            spans.push(Span::styled(buf, matched));
-        } else {
-            spans.push(Span::raw(buf));
-        }
-    }
-    spans
 }
 
 fn render_status(f: &mut ratatui::Frame<'_>, state: &State, cfg: &Config, area: Rect) {
@@ -943,33 +885,6 @@ fn read_link(pid: i32, what: &str) -> Option<String> {
     std::fs::read_link(format!("/proc/{pid}/{what}"))
         .ok()
         .map(|p| p.to_string_lossy().into_owned())
-}
-
-// ---- terminal setup (sleipnir's /dev/tty trick) ---------------------------
-
-fn setup_terminal() -> Result<Terminal<CrosstermBackend<File>>> {
-    let mut tty = File::options()
-        .read(true)
-        .write(true)
-        .open("/dev/tty")
-        .context("open /dev/tty")?;
-    enable_raw_mode().context("enable raw mode")?;
-    execute!(tty, EnterAlternateScreen, EnableMouseCapture).context("enter alternate screen")?;
-    let _ = tty.flush();
-    let backend = CrosstermBackend::new(tty);
-    Terminal::new(backend).context("create terminal")
-}
-
-fn restore_terminal(term: &mut Terminal<CrosstermBackend<File>>) -> Result<()> {
-    disable_raw_mode().context("disable raw mode")?;
-    execute!(
-        term.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )
-    .context("leave alternate screen")?;
-    term.show_cursor().context("show cursor")?;
-    Ok(())
 }
 
 #[cfg(test)]

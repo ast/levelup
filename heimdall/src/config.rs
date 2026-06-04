@@ -1,10 +1,10 @@
-//! User config at `$XDG_CONFIG_HOME/heimdall/config.toml`. Ported from
-//! valkyrie. All optional; bad TOML warns and falls back to defaults.
-
-use std::path::PathBuf;
+//! User config at `$XDG_CONFIG_HOME/heimdall/config.toml`. Palette/layout/loader
+//! come from `levelup_tui::config`; only heimdall's fields live here. All
+//! optional; bad TOML warns and falls back to defaults.
 
 use serde::Deserialize;
-use tracing::warn;
+
+pub use levelup_tui::config::{ColorName, Layout};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -24,13 +24,6 @@ impl Default for Config {
             colors: Colors::default(),
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Layout {
-    Bottom,
-    Top,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -57,75 +50,6 @@ impl Default for Colors {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ColorName {
-    Black,
-    Red,
-    Green,
-    Yellow,
-    Blue,
-    Magenta,
-    Cyan,
-    White,
-    Gray,
-    DarkGray,
-    LightRed,
-    LightGreen,
-    LightYellow,
-    LightBlue,
-    LightMagenta,
-    LightCyan,
-}
-
-impl ColorName {
-    pub fn to_ratatui(self) -> ratatui::style::Color {
-        use ratatui::style::Color::*;
-        match self {
-            Self::Black => Black,
-            Self::Red => Red,
-            Self::Green => Green,
-            Self::Yellow => Yellow,
-            Self::Blue => Blue,
-            Self::Magenta => Magenta,
-            Self::Cyan => Cyan,
-            Self::White => White,
-            Self::Gray => Gray,
-            Self::DarkGray => DarkGray,
-            Self::LightRed => LightRed,
-            Self::LightGreen => LightGreen,
-            Self::LightYellow => LightYellow,
-            Self::LightBlue => LightBlue,
-            Self::LightMagenta => LightMagenta,
-            Self::LightCyan => LightCyan,
-        }
-    }
-}
-
-pub fn default_config_path() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-    Some(base.join("heimdall").join("config.toml"))
-}
-
 pub fn load_or_default() -> Config {
-    let Some(path) = default_config_path() else {
-        return Config::default();
-    };
-    let raw = match std::fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Config::default(),
-        Err(e) => {
-            warn!(error = %e, path = %path.display(), "config read failed; using defaults");
-            return Config::default();
-        }
-    };
-    match toml::from_str(&raw) {
-        Ok(c) => c,
-        Err(e) => {
-            warn!(error = %e, path = %path.display(), "config parse failed; using defaults");
-            Config::default()
-        }
-    }
+    levelup_tui::config::load_or_default(levelup_core::xdg::config_file("heimdall"))
 }

@@ -9,6 +9,7 @@ use std::net::Ipv4Addr;
 use std::path::PathBuf;
 
 use rusqlite::{Connection, params};
+use tracing::debug;
 
 use crate::device::Device;
 
@@ -87,11 +88,13 @@ pub fn load(conn: &Connection) -> Vec<Cached> {
 /// Upsert the devices that have a MAC (the stable identity). `last_seen` is unix
 /// seconds. Done in one transaction.
 pub fn save(conn: &Connection, devices: &[(&Device, i64)]) {
-    let _ = conn.execute_batch("BEGIN;");
+    if let Err(e) = conn.execute_batch("BEGIN;") {
+        debug!(error = %e, "cache save: BEGIN failed");
+    }
     for (d, last_seen) in devices {
         if let Some(mac) = &d.mac {
             let services = d.services.join(",");
-            let _ = conn.execute(
+            if let Err(e) = conn.execute(
                 "INSERT INTO devices(mac, ip, vendor, hostname, services, last_seen)
                  VALUES(?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT(mac) DO UPDATE SET
@@ -105,15 +108,16 @@ pub fn save(conn: &Connection, devices: &[(&Device, i64)]) {
                     services,
                     last_seen
                 ],
-            );
+            ) {
+                debug!(error = %e, %mac, "cache save: upsert failed");
+            }
         }
     }
-    let _ = conn.execute_batch("COMMIT;");
+    if let Err(e) = conn.execute_batch("COMMIT;") {
+        debug!(error = %e, "cache save: COMMIT failed");
+    }
 }
 
 fn default_path() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
-    Some(base.join("heimdall").join("devices.db"))
+    levelup_core::xdg::cache_file("heimdall", "devices.db")
 }

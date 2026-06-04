@@ -1,6 +1,15 @@
 [workspace]
 resolver = "3"
-members = ["hugin", "munin", "mimir", "sleipnir", "valkyrie", "heimdall"]
+members = [
+    "levelup-core",
+    "levelup-tui",
+    "hugin",
+    "munin",
+    "mimir",
+    "sleipnir",
+    "valkyrie",
+    "heimdall",
+]
 
 [workspace.package]
 version = "0.1.0"

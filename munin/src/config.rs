@@ -1,17 +1,16 @@
 //! User config at `$XDG_CONFIG_HOME/munin/config.toml`.
 //!
 //! Everything is optional — a missing file or missing keys just fall back
-//! to defaults. The config schema is intentionally small at first; new keys
-//! get added as new TUI knobs land. Bad TOML or bad values warn to stderr
-//! and the defaults are used (we never refuse to open the TUI over a config
-//! error — `munin search -i` should always work).
-
-use std::path::PathBuf;
+//! to defaults. Bad TOML or bad values warn to stderr and the defaults are
+//! used (we never refuse to open the TUI over a config error — `munin
+//! search -i` should always work). The palette/layout enums and the loader
+//! live in `levelup_tui::config`; only munin's field set lives here.
 
 use serde::Deserialize;
-use tracing::warn;
 
 use crate::proto::SearchSort;
+
+pub use levelup_tui::config::{ColorName, Layout};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -35,15 +34,6 @@ impl Default for Config {
             colors: Colors::default(),
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Layout {
-    /// Prompt at the bottom, results growing upward (fzf-style).
-    Bottom,
-    /// Prompt at the top, results growing downward.
-    Top,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -73,82 +63,9 @@ impl Default for Colors {
     }
 }
 
-/// A subset of ANSI colour names. Hex / 24-bit colours can be added later
-/// without breaking existing configs.
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ColorName {
-    Black,
-    Red,
-    Green,
-    Yellow,
-    Blue,
-    Magenta,
-    Cyan,
-    White,
-    Gray,
-    DarkGray,
-    LightRed,
-    LightGreen,
-    LightYellow,
-    LightBlue,
-    LightMagenta,
-    LightCyan,
-}
-
-impl ColorName {
-    pub fn to_ratatui(self) -> ratatui::style::Color {
-        use ratatui::style::Color::*;
-        match self {
-            Self::Black => Black,
-            Self::Red => Red,
-            Self::Green => Green,
-            Self::Yellow => Yellow,
-            Self::Blue => Blue,
-            Self::Magenta => Magenta,
-            Self::Cyan => Cyan,
-            Self::White => White,
-            Self::Gray => Gray,
-            Self::DarkGray => DarkGray,
-            Self::LightRed => LightRed,
-            Self::LightGreen => LightGreen,
-            Self::LightYellow => LightYellow,
-            Self::LightBlue => LightBlue,
-            Self::LightMagenta => LightMagenta,
-            Self::LightCyan => LightCyan,
-        }
-    }
-}
-
-/// Default path: `$XDG_CONFIG_HOME/munin/config.toml`, falling back to
-/// `$HOME/.config/munin/config.toml`.
-pub fn default_config_path() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-    Some(base.join("munin").join("config.toml"))
-}
-
-/// Load config from the default path. Missing file → defaults. Bad TOML or
-/// unknown keys → log a warning and return defaults; we never crash the TUI
-/// over a config error.
+/// Load config from `$XDG_CONFIG_HOME/munin/config.toml`. Missing file →
+/// defaults. Bad TOML or unknown keys → warn and return defaults; we never
+/// crash the TUI over a config error.
 pub fn load_or_default() -> Config {
-    let Some(path) = default_config_path() else {
-        return Config::default();
-    };
-    let raw = match std::fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Config::default(),
-        Err(e) => {
-            warn!(error = %e, path = %path.display(), "config read failed; using defaults");
-            return Config::default();
-        }
-    };
-    match toml::from_str(&raw) {
-        Ok(c) => c,
-        Err(e) => {
-            warn!(error = %e, path = %path.display(), "config parse failed; using defaults");
-            Config::default()
-        }
-    }
+    levelup_tui::config::load_or_default(levelup_core::xdg::config_file("munin"))
 }

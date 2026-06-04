@@ -13,7 +13,7 @@ use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 
-use crate::util::sanitize_display;
+use levelup_core::sanitize_display;
 
 pub struct Highlighter {
     syntaxes: SyntaxSet,

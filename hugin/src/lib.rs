@@ -14,7 +14,6 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::{Local, TimeZone};
-use tracing_subscriber::EnvFilter;
 
 /// Default unix-socket path for daemon ↔ CLI IPC: `$XDG_RUNTIME_DIR/hugin.sock`
 /// (falls back to `/tmp/hugin.sock`).
@@ -29,12 +28,7 @@ pub fn default_socket_path() -> PathBuf {
 /// env var (falls back to `info`). Idempotent guard left to the caller —
 /// `tracing_subscriber::fmt().init()` will panic on a second call.
 pub fn init_tracing() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_env("HUGIN_LOG").unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .with_writer(std::io::stderr)
-        .init();
+    levelup_core::init_tracing("HUGIN_LOG");
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -165,21 +159,7 @@ pub fn human_size(n: i64) -> String {
 /// (storage stays byte-faithful): C0 → caret notation (`^[`), DEL → `^?`,
 /// newline → `↵`, tab → space, other control (C1) → U+FFFD.
 pub fn sanitize_display(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '\n' => out.push('\u{21B5}'),
-            '\t' => out.push(' '),
-            '\u{7f}' => out.push_str("^?"),
-            c if (c as u32) < 0x20 => {
-                out.push('^');
-                out.push((b'@' + c as u8) as char);
-            }
-            c if c.is_control() => out.push('\u{FFFD}'),
-            c => out.push(c),
-        }
-    }
-    out
+    levelup_core::sanitize_display(s)
 }
 
 /// Like [`sanitize_display`] but preserves newlines and tabs, for multi-line

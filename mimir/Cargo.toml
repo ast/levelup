@@ -9,6 +9,7 @@ name = "mimir"
 path = "src/main.rs"
 
 [dependencies]
+levelup-core = { path = "../levelup-core" }
 anyhow.workspace = true
 thiserror.workspace = true
 clap.workspace = true

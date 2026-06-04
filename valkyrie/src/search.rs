@@ -65,12 +65,8 @@ pub fn rank(mut procs: Vec<Process>, query: &str, sort: Sort) -> Vec<Process> {
         return procs;
     }
 
-    let mut matcher = nucleo_matcher::Matcher::new(nucleo_matcher::Config::DEFAULT);
-    let pattern = nucleo_matcher::pattern::Pattern::parse(
-        q,
-        nucleo_matcher::pattern::CaseMatching::Smart,
-        nucleo_matcher::pattern::Normalization::Smart,
-    );
+    let mut matcher = levelup_core::fuzzy::matcher();
+    let pattern = levelup_core::fuzzy::pattern(q);
 
     let mut hay = Vec::new();
     let mut cmd = Vec::new();
@@ -88,7 +84,7 @@ pub fn rank(mut procs: Vec<Process>, query: &str, sort: Sort) -> Vec<Process> {
         let c = nucleo_matcher::Utf32Str::new(&p.command, &mut cmd);
         if pattern.indices(c, &mut matcher, &mut idx).is_some() {
             idx.sort_unstable();
-            p.snippet = Some(highlight_indices(&p.command, &idx));
+            p.snippet = Some(levelup_core::fuzzy::highlight_indices(&p.command, &idx));
         }
         scored.push((score, p));
     }
@@ -117,43 +113,9 @@ fn parse_port_query(q: &str) -> Option<u16> {
     digits.parse().ok()
 }
 
-/// Wrap matched codepoint runs in `‹…›` (same marker convention as the sibling
-/// crates' TUIs). Iterates `chars().enumerate()` so multi-byte chars don't
-/// shift the markers.
-pub fn highlight_indices(s: &str, indices: &[u32]) -> String {
-    let mut out = String::with_capacity(s.len() + indices.len() * 4);
-    let mut it = indices.iter().copied().peekable();
-    let mut in_match = false;
-    for (i, c) in s.chars().enumerate() {
-        if it.peek() == Some(&(i as u32)) {
-            if !in_match {
-                out.push('‹');
-                in_match = true;
-            }
-            out.push(c);
-            it.next();
-        } else {
-            if in_match {
-                out.push('›');
-                in_match = false;
-            }
-            out.push(c);
-        }
-    }
-    if in_match {
-        out.push('›');
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn highlight_wraps_runs() {
-        assert_eq!(highlight_indices("abcd", &[0, 2]), "‹a›b‹c›d");
-    }
 
     #[test]
     fn port_query_is_exact_only_with_colon() {

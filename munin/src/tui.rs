@@ -16,14 +16,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers,
-};
-use crossterm::execute;
-use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use levelup_tui::highlight::highlight_snippet;
+use levelup_tui::{editing, terminal};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout as LayoutWidget, Rect};
@@ -60,11 +55,11 @@ pub fn run(
     let conn =
         Connection::open(db_path).with_context(|| format!("open db {}", db_path.display()))?;
 
-    let mut term = setup_terminal()?;
+    let mut term = terminal::setup()?;
     let result = run_loop(&mut term, &conn, initial_query, filters, cfg);
     // Always tear down the terminal, even on error, so the user gets their
     // shell back instead of a wedged session.
-    restore_terminal(&mut term).ok();
+    terminal::restore(&mut term).ok();
     result
 }
 
@@ -269,17 +264,21 @@ fn handle_key(key: KeyEvent, state: &mut State) -> KeyOutcome {
 // ---- editing helpers ------------------------------------------------------
 
 fn prev_char_offset(s: &str, pos: usize) -> usize {
-    s[..pos]
-        .chars()
-        .next_back()
-        .map_or(0, |c| pos - c.len_utf8())
+    editing::prev_offset(s, pos)
 }
 
 fn next_char_offset(s: &str, pos: usize) -> usize {
-    s[pos..]
-        .chars()
-        .next()
-        .map_or(s.len(), |c| pos + c.len_utf8())
+    editing::next_offset(s, pos)
+}
+
+/// Map an editing helper's "did it change?" bool onto the TUI's outcome:
+/// a change means the result list must be re-queried.
+fn refresh_if(changed: bool) -> KeyOutcome {
+    if changed {
+        KeyOutcome::Refresh
+    } else {
+        KeyOutcome::Continue
+    }
 }
 
 fn move_cursor_back(state: &mut State) -> KeyOutcome {
@@ -293,50 +292,19 @@ fn move_cursor_forward(state: &mut State) -> KeyOutcome {
 }
 
 fn delete_back_char(state: &mut State) -> KeyOutcome {
-    if state.cursor == 0 {
-        return KeyOutcome::Continue;
-    }
-    let prev = prev_char_offset(&state.query, state.cursor);
-    state.query.replace_range(prev..state.cursor, "");
-    state.cursor = prev;
-    KeyOutcome::Refresh
+    refresh_if(editing::delete_back(&mut state.query, &mut state.cursor))
 }
 
 fn delete_forward_char(state: &mut State) -> KeyOutcome {
-    if state.cursor >= state.query.len() {
-        return KeyOutcome::Continue;
-    }
-    let next = next_char_offset(&state.query, state.cursor);
-    state.query.replace_range(state.cursor..next, "");
-    KeyOutcome::Refresh
+    refresh_if(editing::delete_forward(&mut state.query, &mut state.cursor))
 }
 
 fn kill_to_end(state: &mut State) -> KeyOutcome {
-    if state.cursor >= state.query.len() {
-        return KeyOutcome::Continue;
-    }
-    state.query.truncate(state.cursor);
-    KeyOutcome::Refresh
+    refresh_if(editing::kill_to_end(&mut state.query, &mut state.cursor))
 }
 
 fn delete_back_word(state: &mut State) -> KeyOutcome {
-    if state.cursor == 0 {
-        return KeyOutcome::Continue;
-    }
-    // Find the start of the previous "word", skipping trailing whitespace
-    // first so " foo bar " + cursor-at-end yields "foo ".
-    let prefix = &state.query[..state.cursor];
-    let trimmed = prefix.trim_end();
-    let new_start = trimmed
-        .rfind(char::is_whitespace)
-        .map(|i| i + 1)
-        .unwrap_or(0);
-    if new_start == state.cursor {
-        return KeyOutcome::Continue;
-    }
-    state.query.replace_range(new_start..state.cursor, "");
-    state.cursor = new_start;
-    KeyOutcome::Refresh
+    refresh_if(editing::delete_word(&mut state.query, &mut state.cursor))
 }
 
 fn refresh_results(
@@ -450,53 +418,15 @@ fn render_row(entry: &EntryMeta, match_fg: ratatui::style::Color) -> Line<'stati
     // Search results carry a snippet with `‹›` markers. Walk the snippet and
     // colour the matched runs. List/get results (no snippet) just show cmd.
     if let Some(snippet) = entry.snippet.as_deref() {
-        spans.extend(highlight_snippet(snippet, match_fg));
+        spans.extend(highlight_snippet(
+            snippet,
+            match_fg,
+            ratatui::style::Color::Reset,
+        ));
     } else {
         spans.push(Span::raw(sanitize_display(&entry.cmd)));
     }
     Line::from(spans)
-}
-
-fn highlight_snippet(s: &str, match_fg: ratatui::style::Color) -> Vec<Span<'static>> {
-    // Neutralize control bytes up front (a stored `ESC[?1003h` would otherwise
-    // drive the terminal). `sanitize_display` never emits `‹`/`›`, so the match
-    // markers survive and the parse below stays correct.
-    let s = sanitize_display(s);
-    let mut spans = Vec::new();
-    let mut buf = String::new();
-    let mut in_match = false;
-    for ch in s.chars() {
-        match ch {
-            '‹' => {
-                if !buf.is_empty() {
-                    spans.push(Span::raw(std::mem::take(&mut buf)));
-                }
-                in_match = true;
-            }
-            '›' => {
-                if !buf.is_empty() {
-                    spans.push(Span::styled(
-                        std::mem::take(&mut buf),
-                        Style::default().fg(match_fg).add_modifier(Modifier::BOLD),
-                    ));
-                }
-                in_match = false;
-            }
-            '\n' => buf.push('\u{21B5}'),
-            c => buf.push(c),
-        }
-    }
-    if !buf.is_empty() {
-        if in_match {
-            spans.push(Span::styled(
-                buf,
-                Style::default().fg(match_fg).add_modifier(Modifier::BOLD),
-            ));
-        } else {
-            spans.push(Span::raw(buf));
-        }
-    }
-    spans
 }
 
 fn render_status(f: &mut ratatui::Frame<'_>, state: &State, cfg: &Config, area: Rect) {
@@ -533,35 +463,4 @@ fn render_prompt(f: &mut ratatui::Frame<'_>, state: &State, cfg: &Config, area: 
         let max_x = area.x.saturating_add(area.width).saturating_sub(1);
         f.set_cursor_position((cursor_x.min(max_x), area.y));
     }
-}
-
-fn setup_terminal() -> Result<Terminal<CrosstermBackend<File>>> {
-    // Render to /dev/tty, NOT stdout: the shell hook invokes the picker as
-    // `chosen=$(munin search -i ...)`, so stdout is captured for the chosen
-    // command. If the alternate-screen drawing went to stdout it would be
-    // swallowed into that variable (the screen stays blank and the escape
-    // codes end up on the command line). Writing to the controlling terminal
-    // directly — the fzf/atuin approach — keeps stdout clean for the result.
-    // crossterm reads input events from /dev/tty itself, so input is unaffected.
-    let mut tty = File::options()
-        .read(true)
-        .write(true)
-        .open("/dev/tty")
-        .context("open /dev/tty")?;
-    enable_raw_mode().context("enable raw mode")?;
-    execute!(tty, EnterAlternateScreen, EnableMouseCapture).context("enter alternate screen")?;
-    let backend = CrosstermBackend::new(tty);
-    Terminal::new(backend).context("create terminal")
-}
-
-fn restore_terminal(term: &mut Terminal<CrosstermBackend<File>>) -> Result<()> {
-    disable_raw_mode().context("disable raw mode")?;
-    execute!(
-        term.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )
-    .context("leave alternate screen")?;
-    term.show_cursor().context("show cursor")?;
-    Ok(())
 }

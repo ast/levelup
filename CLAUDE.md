@@ -4,18 +4,43 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project vision
 
-A Rust workspace of two personal-computing tools:
+A Rust workspace of personal-computing tools for a sway/wlroots Linux desktop, plus two shared library crates they all build on. Norse names throughout; Jef Raskin (*The Humane Interface*) + Don Norman lineage across the interactive pickers.
 
-- **hugin** — Wayland clipboard manager for sway/wlroots compositors. Watches the clipboard via `wlr-data-control-unstable-v1` and persists every selection change. Eventual goals: expose clipboard history to AI via an MCP server, and synchronize between machines.
-- **munin** — atuin-like shell history search with an fzf-style UI, fully customisable by the user. Currently a stub.
+**Tools** (one binary family each):
 
-Both crates use `clap`, `thiserror`, `anyhow`, and `tracing` from `[workspace.dependencies]`.
+- **hugin** — Wayland clipboard manager for sway/wlroots compositors. Watches the clipboard via `wlr-data-control-unstable-v1` and persists every selection change. fzf-style search picker (`hugin search -i`). Eventual goals: expose clipboard history to AI via an MCP server, and synchronize between machines.
+- **munin** — atuin-like shell history search with an fzf-style UI, fully customisable by the user. Daemon (`munind`) + CLI (`munin`); captures write directly to SQLite from shell hooks.
+- **mimir** — compact interactive status bar for sway (an i3status replacement). Single foreground process speaking the swaybar/i3bar JSON protocol; reads `/proc` & `/sys` via `nom`. No SQLite, no TUI picker.
+- **sleipnir** — modeless frecency navigator (`Ctrl-T`): one picker over directories *and* files you've touched (dirs from a chpwd hook, files mined from munin's history).
+- **valkyrie** — modeless, humane process finder/handler (`Alt-P`): fuzzy-find processes and signal them (SIGTERM / hold-to-SIGKILL / STOP-CONT / any signal). No daemon, no storage.
+- **heimdall** — rootless, presence-first LAN device finder: concurrent ARP-sweep + mDNS + SSDP, live picker, MAC-keyed SQLite *cache* (not history). Background tokio engine → sync ratatui TUI over a channel.
+
+**Shared library crates** (see "Shared crates" below):
+
+- **levelup-core** — leaf helpers with no TUI deps: `init_tracing`, `sanitize_display`, `fuzzy` (nucleo matcher/pattern/highlight), `sqlite` (schema-version gate), `xdg` (base-dir paths).
+- **levelup-tui** — picker building blocks: `config` (ANSI palette / layout enums + TOML loader), `editing` (readline cursor/kill helpers), `highlight` (`‹›`-marker → ratatui spans), `terminal` (`/dev/tty` alternate-screen setup/teardown).
+
+Tools use `clap`, `thiserror`, `anyhow`, and `tracing` from `[workspace.dependencies]`.
 
 ## Workspace shape
 
-Edition `2024`, resolver `"3"`. The workspace `Cargo.toml` at the repo root pins shared dependency versions; members inherit them with `.workspace = true`.
+Edition `2024`, resolver `"3"`. The workspace `Cargo.toml` at the repo root pins shared dependency versions; members inherit them with `.workspace = true`. Members: `levelup-core`, `levelup-tui`, `hugin`, `munin`, `mimir`, `sleipnir`, `valkyrie`, `heimdall`. The repo root is the git repository; the authoritative lockfile is `./Cargo.lock`.
 
-Quirk: **each member directory has its own nested `.git/`** — the workspace root itself is not a git repository. Stale per-crate `Cargo.lock` files (`hugin/Cargo.lock`, `munin/Cargo.lock`) may exist from before the workspace was set up; the authoritative lockfile is `./Cargo.lock`.
+Every binary embeds its git commit in `--version` via a per-crate `build.rs` (`cargo:rustc-env=GIT_COMMIT` → `VERSION = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_COMMIT"), ")")`).
+
+## Shared crates (levelup-core / levelup-tui)
+
+Extracted from five near-identical picker copies (the agreed trigger; see the roadmap notes). The extraction is a **toolkit, not a framework** — shared *leaf helpers and types*, while each tool keeps its own `State`, event loop, and render code. This is deliberate: valkyrie's process tree, heimdall's flexible `Table` + detail strip, and the modal choosers don't fit one generic `Picker` abstraction.
+
+- **levelup-core** (`fuzzy`, `sqlite`, `xdg`, `init_tracing`, `sanitize_display`) — no ratatui/crossterm deps, so non-TUI crates (mimir) can use it too.
+  - `fuzzy::{matcher, pattern, highlight_indices}` — nucleo with fzf defaults (`CaseMatching::Smart` + `Normalization::Smart`); `highlight_indices` wraps matched codepoint runs in `‹…›`.
+  - `sqlite::ensure_compatible_schema(conn, path, version, sentinel)` + `table_exists` — the version-gate-before-pragmas discipline, parameterised by schema version and the table whose presence means "not a fresh DB".
+  - `xdg::{data_file, config_file, cache_file, runtime_file, …}` — return types chosen to match existing call sites (`config_file` → `Option`, `data_file` → `Result`).
+- **levelup-tui** (`config`, `editing`, `highlight`, `terminal`) — depends on levelup-core + ratatui/crossterm.
+  - `config::{ColorName, Layout, load_or_default}` — the named-ANSI palette, layout enum, and the generic `load_or_default::<T>(Option<PathBuf>)` loader (warn-and-default on bad TOML). Each tool's `config.rs` is now a thin shim: `pub use` the enums, declare its own `Config`/`Colors` field set, and call the generic loader.
+  - `editing::{prev_offset, next_offset, delete_back, delete_forward, kill_to_end, kill_line, delete_word}` — return `bool` (changed?), so each tool maps that onto its own refresh mechanism (e.g. munin/hugin's `KeyOutcome`, valkyrie's direct `refresh_results`).
+  - `highlight::highlight_snippet(s, match_fg, base)` — parses the `‹›` markers into ratatui spans (calls `levelup_core::sanitize_display` first).
+  - `terminal::{setup, restore}` — `setup` opens `/dev/tty` (the load-bearing not-stdout trick) and returns a `File`-backed terminal; all six pickers (hugin included) use it, so the alternate screen never lands on stdout and piping output stays clean. `restore` is generic over the backend writer.
 
 ## Common commands
 
@@ -196,6 +221,6 @@ Numbered milestones, same convention. Daemon-first design (decided during M0 pla
 - **M4** (done) — Interactive TUI. `munin search -i` opens an fzf-style picker (`ratatui` + `crossterm`) seeded with the typed query. Two-action selection (atuin-style): **Enter** = run immediately (exit 0); **Tab** = drop on the command line for editing (exit 2); **Esc/Ctrl-C** = cancel (exit 1). The shell hook in M5 reads the exit code. Full Emacs/readline editing in the prompt: Ctrl-A/E (line ends), Ctrl-B/F + Left/Right (cursor), Ctrl-P/Ctrl-N (list nav, alias of Up/Down), Backspace/Ctrl-H (delete back), Ctrl-D (delete forward / cancel on empty), Ctrl-K (kill to end), Ctrl-W (kill word back), Ctrl-U (kill line), Ctrl-R (toggle relevance↔recent). UTF-8-safe via `prev_char_offset`/`next_char_offset`. Reads SQLite directly (bypasses the daemon) so the TUI works even when `munind` is down. Config file at `$XDG_CONFIG_HOME/munin/config.toml` (sort/limit/layout + named-ANSI colours) — all optional, bad config warns and falls through to defaults. Also adds the atuin importer (covered in M2 above). Search backend swapped from FTS5 to nucleo during this milestone (see M3 note).
 - **M5** (done) — Shell binding. `munin init <shell>` output now includes a `_munin_search` widget bound to Ctrl-R that runs `munin search -i -- "$BUFFER"` and consumes the TUI's exit-code contract. zsh honours the three outcomes (0 → `BUFFER=…; zle accept-line`; 2 → `BUFFER=…; zle reset-prompt`; 1 → `zle reset-prompt`). bash uses `bind -x` + `READLINE_LINE`/`READLINE_POINT`; known limitation — `bind -x` cannot trigger Enter from inside the bound function, so exit 0 and exit 2 both land the command on the prompt and the user hits Enter to run. Reads-bypass-daemon (also shipped in this milestone) means Ctrl-R works with `munind` down.
 
-**Critical gotcha — the picker renders to `/dev/tty`, not stdout.** The shell hook captures the chosen command with `chosen=$(munin search -i …)`, which captures the picker's **stdout**. So the TUI must NOT draw to stdout — `setup_terminal` (`munin/src/tui.rs`) opens `/dev/tty` read+write and points the `CrosstermBackend` at *that* (the fzf/atuin approach); only the final chosen command is `println!`'d to stdout (`bin/munin.rs::run_tui`). crossterm reads key events from `/dev/tty` itself, so input is unaffected. If the backend is ever switched back to `io::stdout()`, the alternate-screen escape codes get swallowed into `$chosen`: the screen stays blank, Ctrl-R "does nothing", and the captured escape soup lands on the command line. (This bit exactly once — the original M6 code used `CrosstermBackend<Stdout>`.)
+**Critical gotcha — the picker renders to `/dev/tty`, not stdout.** The shell hook captures the chosen command with `chosen=$(munin search -i …)`, which captures the picker's **stdout**. So the TUI must NOT draw to stdout — the shared `levelup_tui::terminal::setup` opens `/dev/tty` read+write and points the `CrosstermBackend` at *that* (the fzf/atuin approach); only the final chosen command is `println!`'d to stdout (`bin/munin.rs::run_tui`). crossterm reads key events from `/dev/tty` itself, so input is unaffected. If the backend is ever switched back to `io::stdout()`, the alternate-screen escape codes get swallowed into `$chosen`: the screen stays blank, Ctrl-R "does nothing", and the captured escape soup lands on the command line. (This bit exactly once — the original M6 code used `CrosstermBackend<Stdout>`.)
 - **M6** — Sync. Self-hosted server, end-to-end encryption (Argon2id-derived symmetric key), push-unsynced + pull-since loop in `munind`. Schema is already ready for it (see "Sync columns" in the architecture section above).
 - **Later** — MCP server exposing history to AI for "what did I run last week that did X?" queries.

@@ -6,20 +6,14 @@
 
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::Write;
 use std::net::Ipv4Addr;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
-use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers,
-};
-use crossterm::execute;
-use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-};
+use anyhow::Result;
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use levelup_core::sanitize_display;
+use levelup_tui::{editing, terminal};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout as LayoutWidget, Rect};
@@ -33,7 +27,6 @@ use crate::cache;
 use crate::config::{self, Config};
 use crate::device::{Device, Seen};
 use crate::discover::{self, engine, engine::Engine};
-use crate::util::sanitize_display;
 
 const TICK: Duration = Duration::from_millis(100);
 /// Dim a device once it hasn't been re-seen for this long (going quiet).
@@ -85,9 +78,9 @@ pub fn run() -> Result<()> {
     let cidrs = discover::local_cidrs().join(", ");
     let cache = cache::open();
     let engine = engine::spawn();
-    let mut term = setup_terminal()?;
+    let mut term = terminal::setup()?;
     let result = run_loop(&mut term, engine, cidrs, cache, &cfg);
-    restore_terminal(&mut term).ok();
+    terminal::restore(&mut term).ok();
     result
 }
 
@@ -177,11 +170,11 @@ fn run_loop(
                 Step::Ssh(ip) => {
                     // ssh takes over the terminal: drop the alternate screen,
                     // run it in the foreground, then re-enter the picker.
-                    restore_terminal(term).ok();
+                    terminal::restore(term).ok();
                     let _ = std::process::Command::new("ssh")
                         .arg(ip.to_string())
                         .status();
-                    *term = setup_terminal()?;
+                    *term = terminal::setup()?;
                     let _ = term.clear();
                     state.set_status(format!("returned from ssh {ip}"));
                 }
@@ -256,12 +249,8 @@ impl State {
                 })
                 .collect()
         } else {
-            let mut matcher = nucleo_matcher::Matcher::new(nucleo_matcher::Config::DEFAULT);
-            let pattern = nucleo_matcher::pattern::Pattern::parse(
-                q,
-                nucleo_matcher::pattern::CaseMatching::Smart,
-                nucleo_matcher::pattern::Normalization::Smart,
-            );
+            let mut matcher = levelup_core::fuzzy::matcher();
+            let pattern = levelup_core::fuzzy::pattern(q);
             let mut buf = Vec::new();
             let mut scored: Vec<(u32, Row)> = Vec::new();
             for e in self.devices.values() {
@@ -373,36 +362,16 @@ fn handle_key(key: KeyEvent, state: &mut State) -> Step {
 }
 
 fn prev_off(s: &str, pos: usize) -> usize {
-    s[..pos]
-        .chars()
-        .next_back()
-        .map_or(0, |c| pos - c.len_utf8())
+    editing::prev_offset(s, pos)
 }
 fn next_off(s: &str, pos: usize) -> usize {
-    s[pos..]
-        .chars()
-        .next()
-        .map_or(s.len(), |c| pos + c.len_utf8())
+    editing::next_offset(s, pos)
 }
 fn delete_back(state: &mut State) {
-    if state.cursor == 0 {
-        return;
-    }
-    let prev = prev_off(&state.query, state.cursor);
-    state.query.replace_range(prev..state.cursor, "");
-    state.cursor = prev;
+    editing::delete_back(&mut state.query, &mut state.cursor);
 }
 fn delete_word(state: &mut State) {
-    if state.cursor == 0 {
-        return;
-    }
-    let trimmed = state.query[..state.cursor].trim_end();
-    let start = trimmed
-        .rfind(char::is_whitespace)
-        .map(|i| i + 1)
-        .unwrap_or(0);
-    state.query.replace_range(start..state.cursor, "");
-    state.cursor = start;
+    editing::delete_word(&mut state.query, &mut state.cursor);
 }
 
 // ---- rendering ------------------------------------------------------------
@@ -480,14 +449,8 @@ fn render_list(f: &mut ratatui::Frame<'_>, state: &mut State, cfg: &Config, area
         .add_modifier(Modifier::BOLD);
 
     let q = state.query.trim();
-    let pattern = (!q.is_empty()).then(|| {
-        nucleo_matcher::pattern::Pattern::parse(
-            q,
-            nucleo_matcher::pattern::CaseMatching::Smart,
-            nucleo_matcher::pattern::Normalization::Smart,
-        )
-    });
-    let mut matcher = nucleo_matcher::Matcher::new(nucleo_matcher::Config::DEFAULT);
+    let pattern = (!q.is_empty()).then(|| levelup_core::fuzzy::pattern(q));
+    let mut matcher = levelup_core::fuzzy::matcher();
 
     let header = TableRow::new(["IP", "MAC", "VENDOR", "HOST", "SERVICES"])
         .style(Style::default().fg(dim).add_modifier(Modifier::BOLD));
@@ -660,31 +623,4 @@ fn flush_cache(cache: &Option<Connection>, devices: &BTreeMap<Ipv4Addr, Entry>) 
         .unwrap_or(0);
     let devs: Vec<(&Device, i64)> = devices.values().map(|e| (&e.device, now_unix)).collect();
     cache::save(c, &devs);
-}
-
-// ---- terminal (sleipnir/valkyrie /dev/tty trick) --------------------------
-
-fn setup_terminal() -> Result<Terminal<CrosstermBackend<File>>> {
-    let mut tty = File::options()
-        .read(true)
-        .write(true)
-        .open("/dev/tty")
-        .context("open /dev/tty")?;
-    enable_raw_mode().context("enable raw mode")?;
-    execute!(tty, EnterAlternateScreen, EnableMouseCapture).context("enter alternate screen")?;
-    let _ = tty.flush();
-    let backend = CrosstermBackend::new(tty);
-    Terminal::new(backend).context("create terminal")
-}
-
-fn restore_terminal(term: &mut Terminal<CrosstermBackend<File>>) -> Result<()> {
-    disable_raw_mode().context("disable raw mode")?;
-    execute!(
-        term.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )
-    .context("leave alternate screen")?;
-    term.show_cursor().context("show cursor")?;
-    Ok(())
 }

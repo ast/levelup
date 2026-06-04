@@ -4,7 +4,7 @@ use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use tracing::{debug, info, warn};
 
@@ -110,7 +110,7 @@ impl Store {
         // Version check runs before any pragmas: WAL leaves -wal/-shm sidecars
         // on disk, and we don't want to scatter them around a DB we're about
         // to refuse.
-        ensure_compatible_schema(&conn, path)?;
+        levelup_core::sqlite::ensure_compatible_schema(&conn, path, DB_VERSION, "entries")?;
         conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;")
             .context("set pragmas")?;
         // Schema apply and the version stamp must be atomic. Otherwise a
@@ -211,38 +211,6 @@ impl Store {
     }
 }
 
-/// Refuse to open a database produced by a different schema generation.
-/// Fresh DBs (no `entries` table yet) pass through unconditionally; anything
-/// else must match `DB_VERSION`. Pre-versioning DBs sit at `user_version = 0`
-/// with an `entries` table and the brief FTS build stamped `user_version = 2`
-/// — both are refused here so the user deletes the file (no migration; this
-/// is dev-stage). Same discipline as `munin/src/storage.rs`.
-fn ensure_compatible_schema(conn: &Connection, path: &Path) -> Result<()> {
-    let version: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    if version == DB_VERSION {
-        return Ok(());
-    }
-    if version == 0 && !table_exists(conn, "entries")? {
-        return Ok(());
-    }
-    bail!(
-        "incompatible hugin database at {}: schema v{version}, daemon expects v{DB_VERSION}. \
-         No automatic migration; delete the file and restart to recreate.",
-        path.display(),
-    );
-}
-
-fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
-    Ok(conn
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type IN ('table','view') AND name = ?1",
-            params![name],
-            |_| Ok(true),
-        )
-        .optional()?
-        .unwrap_or(false))
-}
-
 fn canonical_hash(parts: &[CapturedPart]) -> blake3::Hash {
     let mut sorted: Vec<&CapturedPart> = parts.iter().collect();
     sorted.sort_by(|a, b| a.mime.cmp(&b.mime));
@@ -290,11 +258,7 @@ fn pick_indexable_text(parts: &[CapturedPart]) -> Option<String> {
 }
 
 pub fn default_db_path() -> Result<PathBuf> {
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
-        .context("neither XDG_DATA_HOME nor HOME is set")?;
-    Ok(base.join("hugin").join("hugin.db"))
+    levelup_core::xdg::data_file("hugin", "hugin.db")
 }
 
 pub fn run_storage_thread(
@@ -386,12 +350,8 @@ pub fn search(
         .collect::<rusqlite::Result<_>>()?;
     drop(stmt);
 
-    let mut matcher = nucleo_matcher::Matcher::new(nucleo_matcher::Config::DEFAULT);
-    let pattern = nucleo_matcher::pattern::Pattern::parse(
-        trimmed,
-        nucleo_matcher::pattern::CaseMatching::Smart,
-        nucleo_matcher::pattern::Normalization::Smart,
-    );
+    let mut matcher = levelup_core::fuzzy::matcher();
+    let pattern = levelup_core::fuzzy::pattern(trimmed);
 
     let mut hay_buf = Vec::new();
     let mut idx_buf = Vec::new();
@@ -406,7 +366,7 @@ pub fn search(
         if let Some(score) = pattern.indices(haystack, &mut matcher, &mut idx_buf) {
             // nucleo doesn't guarantee sorted indices; sort before walking.
             idx_buf.sort_unstable();
-            row.4 = Some(highlight_indices(hay, &idx_buf));
+            row.4 = Some(levelup_core::fuzzy::highlight_indices(hay, &idx_buf));
             scored.push((score, row));
         }
     }
@@ -433,36 +393,6 @@ fn prefix_chars(s: &str, max_chars: usize) -> &str {
         Some((byte_idx, _)) => &s[..byte_idx],
         None => s,
     }
-}
-
-/// Walk `s` codepoint by codepoint; wrap runs of matched positions
-/// (`indices`, sorted ascending) in `‹…›`. The CLI table and the TUI's
-/// `highlight_snippet` parse these markers to colour the matched runs.
-fn highlight_indices(s: &str, indices: &[u32]) -> String {
-    let mut out = String::with_capacity(s.len() + indices.len() * 4);
-    let mut idx_iter = indices.iter().copied().peekable();
-    let mut in_match = false;
-    for (i, c) in s.chars().enumerate() {
-        let is_match = idx_iter.peek() == Some(&(i as u32));
-        if is_match {
-            if !in_match {
-                out.push('‹');
-                in_match = true;
-            }
-            out.push(c);
-            idx_iter.next();
-        } else {
-            if in_match {
-                out.push('›');
-                in_match = false;
-            }
-            out.push(c);
-        }
-    }
-    if in_match {
-        out.push('›');
-    }
-    out
 }
 
 /// Delete an entry (and its `mime_parts`, via the FK cascade). Returns

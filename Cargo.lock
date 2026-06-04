@@ -677,6 +677,8 @@ dependencies = [
  "clap",
  "crossterm",
  "if-addrs",
+ "levelup-core",
+ "levelup-tui",
  "mac_oui",
  "mdns-sd",
  "nucleo-matcher",
@@ -699,6 +701,8 @@ dependencies = [
  "clap",
  "clap_complete",
  "crossterm",
+ "levelup-core",
+ "levelup-tui",
  "nix",
  "nucleo-matcher",
  "ratatui",
@@ -857,6 +861,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
 
 [[package]]
+name = "levelup-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "nucleo-matcher",
+ "rusqlite",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "levelup-tui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "crossterm",
+ "levelup-core",
+ "ratatui",
+ "serde",
+ "toml",
+ "tracing",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -981,6 +1008,7 @@ dependencies = [
  "chrono-tz",
  "clap",
  "clap_complete",
+ "levelup-core",
  "nix",
  "nom",
  "serde",
@@ -1030,6 +1058,8 @@ dependencies = [
  "chrono",
  "clap",
  "crossterm",
+ "levelup-core",
+ "levelup-tui",
  "nucleo-matcher",
  "ratatui",
  "rusqlite",
@@ -1508,6 +1538,8 @@ dependencies = [
  "clap",
  "crossterm",
  "ignore",
+ "levelup-core",
+ "levelup-tui",
  "nucleo-matcher",
  "ratatui",
  "rusqlite",
@@ -1867,6 +1899,8 @@ dependencies = [
  "anyhow",
  "clap",
  "crossterm",
+ "levelup-core",
+ "levelup-tui",
  "nix",
  "nucleo-matcher",
  "ratatui",

@@ -10,7 +10,6 @@ mod config;
 mod device;
 mod discover;
 mod tui;
-mod util;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -45,7 +44,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some(Cmd::Scan) => {
-            util::init_tracing();
+            levelup_core::init_tracing("HEIMDALL_LOG");
             run_scan()
         }
         // No subcommand → the live interactive picker.

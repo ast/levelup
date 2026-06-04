@@ -12,15 +12,8 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
-use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers,
-};
-use crossterm::execute;
-use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-};
+use anyhow::Result;
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout as LayoutWidget, Rect};
@@ -28,10 +21,14 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 
+use levelup_core::sanitize_display;
+use levelup_tui::editing;
+use levelup_tui::highlight::highlight_snippet;
+use levelup_tui::terminal;
+
 use crate::config::{Config, Layout};
 use crate::highlight::Highlighter;
 use crate::storage::{self, Kind, Row};
-use crate::util::sanitize_display;
 
 /// What the user chose. The bin layer prints `<action>\t<path>` (the shell
 /// widget reads that) for the first two, and exits 1 for `Cancel`.
@@ -48,10 +45,10 @@ pub enum Outcome {
 /// walk), seeded with `initial_query`. The pool is built once up front, so
 /// per-keystroke scoring stays in memory.
 pub fn run(pool: Vec<Row>, initial_query: String, cfg: &Config) -> Result<Outcome> {
-    let mut term = setup_terminal()?;
+    let mut term = terminal::setup()?;
     let result = run_loop(&mut term, pool, initial_query, cfg);
     // Always tear the terminal down so the user gets their shell back.
-    restore_terminal(&mut term).ok();
+    terminal::restore(&mut term).ok();
     result
 }
 
@@ -241,73 +238,38 @@ fn handle_key(key: KeyEvent, state: &mut State) -> KeyOutcome {
 
 // ---- editing helpers (verbatim from munin) --------------------------------
 
-fn prev_char_offset(s: &str, pos: usize) -> usize {
-    s[..pos]
-        .chars()
-        .next_back()
-        .map_or(0, |c| pos - c.len_utf8())
-}
-
-fn next_char_offset(s: &str, pos: usize) -> usize {
-    s[pos..]
-        .chars()
-        .next()
-        .map_or(s.len(), |c| pos + c.len_utf8())
+fn refresh_if(changed: bool) -> KeyOutcome {
+    if changed {
+        KeyOutcome::Refresh
+    } else {
+        KeyOutcome::Continue
+    }
 }
 
 fn move_cursor_back(state: &mut State) -> KeyOutcome {
-    state.cursor = prev_char_offset(&state.query, state.cursor);
+    state.cursor = editing::prev_offset(&state.query, state.cursor);
     KeyOutcome::Continue
 }
 
 fn move_cursor_forward(state: &mut State) -> KeyOutcome {
-    state.cursor = next_char_offset(&state.query, state.cursor);
+    state.cursor = editing::next_offset(&state.query, state.cursor);
     KeyOutcome::Continue
 }
 
 fn delete_back_char(state: &mut State) -> KeyOutcome {
-    if state.cursor == 0 {
-        return KeyOutcome::Continue;
-    }
-    let prev = prev_char_offset(&state.query, state.cursor);
-    state.query.replace_range(prev..state.cursor, "");
-    state.cursor = prev;
-    KeyOutcome::Refresh
+    refresh_if(editing::delete_back(&mut state.query, &mut state.cursor))
 }
 
 fn delete_forward_char(state: &mut State) -> KeyOutcome {
-    if state.cursor >= state.query.len() {
-        return KeyOutcome::Continue;
-    }
-    let next = next_char_offset(&state.query, state.cursor);
-    state.query.replace_range(state.cursor..next, "");
-    KeyOutcome::Refresh
+    refresh_if(editing::delete_forward(&mut state.query, &mut state.cursor))
 }
 
 fn kill_to_end(state: &mut State) -> KeyOutcome {
-    if state.cursor >= state.query.len() {
-        return KeyOutcome::Continue;
-    }
-    state.query.truncate(state.cursor);
-    KeyOutcome::Refresh
+    refresh_if(editing::kill_to_end(&mut state.query, &mut state.cursor))
 }
 
 fn delete_back_word(state: &mut State) -> KeyOutcome {
-    if state.cursor == 0 {
-        return KeyOutcome::Continue;
-    }
-    let prefix = &state.query[..state.cursor];
-    let trimmed = prefix.trim_end();
-    let new_start = trimmed
-        .rfind(char::is_whitespace)
-        .map(|i| i + 1)
-        .unwrap_or(0);
-    if new_start == state.cursor {
-        return KeyOutcome::Continue;
-    }
-    state.query.replace_range(new_start..state.cursor, "");
-    state.cursor = new_start;
-    KeyOutcome::Refresh
+    refresh_if(editing::delete_word(&mut state.query, &mut state.cursor))
 }
 
 fn refresh_results(state: &mut State, cfg: &Config) {
@@ -429,39 +391,6 @@ fn render_row(row: &Row, match_fg: Color, dir_fg: Color, file_fg: Color) -> Line
     Line::from(spans)
 }
 
-/// Parse `‹›` markers: matched runs get `match_fg` bold, everything else
-/// `base_fg`. Control bytes are neutralised first (`sanitize_display` never
-/// emits the markers, so they survive).
-fn highlight_snippet(s: &str, match_fg: Color, base_fg: Color) -> Vec<Span<'static>> {
-    let s = sanitize_display(s);
-    let mut spans = Vec::new();
-    let mut buf = String::new();
-    let mut in_match = false;
-    let base = Style::default().fg(base_fg);
-    let matched = Style::default().fg(match_fg).add_modifier(Modifier::BOLD);
-    for ch in s.chars() {
-        match ch {
-            '‹' => {
-                if !buf.is_empty() {
-                    spans.push(Span::styled(std::mem::take(&mut buf), base));
-                }
-                in_match = true;
-            }
-            '›' => {
-                if !buf.is_empty() {
-                    spans.push(Span::styled(std::mem::take(&mut buf), matched));
-                }
-                in_match = false;
-            }
-            c => buf.push(c),
-        }
-    }
-    if !buf.is_empty() {
-        spans.push(Span::styled(buf, if in_match { matched } else { base }));
-    }
-    spans
-}
-
 fn render_status(f: &mut ratatui::Frame<'_>, state: &State, cfg: &Config, area: Rect) {
     // Hint reflects what Enter/Tab will do for the *current* selection — the
     // action is modeless (no toggle) but its effect depends on the row type,
@@ -564,34 +493,6 @@ fn preview_file(path: &str, max_rows: usize) -> Vec<String> {
         // Lossy/!UTF-8 or read errors → stop early rather than erroring out.
         .map_while(|l| l.ok())
         .collect()
-}
-
-fn setup_terminal() -> Result<Terminal<CrosstermBackend<File>>> {
-    // Render to /dev/tty, NOT stdout: the shell widget captures stdout
-    // (`out=$(sleipnir pick ...)`) for the result line. Drawing the alternate
-    // screen to stdout would get swallowed into that capture (blank screen,
-    // escape soup on the command line). Same load-bearing trick as munin.
-    let mut tty = File::options()
-        .read(true)
-        .write(true)
-        .open("/dev/tty")
-        .context("open /dev/tty")?;
-    enable_raw_mode().context("enable raw mode")?;
-    execute!(tty, EnterAlternateScreen, EnableMouseCapture).context("enter alternate screen")?;
-    let backend = CrosstermBackend::new(tty);
-    Terminal::new(backend).context("create terminal")
-}
-
-fn restore_terminal(term: &mut Terminal<CrosstermBackend<File>>) -> Result<()> {
-    disable_raw_mode().context("disable raw mode")?;
-    execute!(
-        term.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )
-    .context("leave alternate screen")?;
-    term.show_cursor().context("show cursor")?;
-    Ok(())
 }
 
 #[cfg(test)]

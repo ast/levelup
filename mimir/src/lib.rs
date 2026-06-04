@@ -12,18 +12,11 @@ pub mod protocol;
 pub mod render;
 pub mod sys;
 
-use tracing_subscriber::EnvFilter;
-
 /// Install a `tracing_subscriber` writing to **stderr** (stdout is the
 /// swaybar protocol and must stay clean JSON), honouring the `MIMIR_LOG`
-/// env var (falls back to `info`). Mirrors `munin::init_tracing`.
+/// env var (falls back to `info`).
 pub fn init_tracing() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_env("MIMIR_LOG").unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .with_writer(std::io::stderr)
-        .init();
+    levelup_core::init_tracing("MIMIR_LOG");
 }
 
 /// Compact human-readable byte size: `512B` / `4K` / `34M` / `15.4G` / `2.1T`.

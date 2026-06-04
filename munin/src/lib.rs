@@ -12,8 +12,6 @@ pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_COM
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tracing_subscriber::EnvFilter;
-
 /// Default unix-socket path for daemon ↔ CLI IPC: `$XDG_RUNTIME_DIR/munin.sock`
 /// (falls back to `/tmp/munin.sock`).
 pub fn default_socket_path() -> PathBuf {
@@ -26,12 +24,7 @@ pub fn default_socket_path() -> PathBuf {
 /// Install a `tracing_subscriber` writing to stderr, honouring the `MUNIN_LOG`
 /// env var (falls back to `info`).
 pub fn init_tracing() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_env("MUNIN_LOG").unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .with_writer(std::io::stderr)
-        .init();
+    levelup_core::init_tracing("MUNIN_LOG");
 }
 
 pub fn now_unix_ns() -> i64 {
@@ -73,21 +66,7 @@ pub fn fmt_dur(ms: Option<i64>) -> String {
 /// notation (`^[`), DEL → `^?`, newline → `↵`, tab → space, other control
 /// (C1) → U+FFFD. Shared by the CLI's printers and the TUI's row renderer.
 pub fn sanitize_display(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '\n' => out.push('\u{21B5}'),
-            '\t' => out.push(' '),
-            '\u{7f}' => out.push_str("^?"),
-            c if (c as u32) < 0x20 => {
-                out.push('^');
-                out.push((b'@' + c as u8) as char);
-            }
-            c if c.is_control() => out.push('\u{FFFD}'),
-            c => out.push(c),
-        }
-    }
-    out
+    levelup_core::sanitize_display(s)
 }
 
 #[cfg(test)]

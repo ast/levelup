@@ -26,7 +26,7 @@ use clap::{Parser, Subcommand};
 use crate::shells::Shell;
 use crate::storage::{Kind, Row, default_db_path};
 use crate::tui::Outcome;
-use crate::util::{init_tracing, now_unix_secs};
+use crate::util::now_unix_secs;
 
 /// `"<pkgver> (<git-commit>)"` — the git commit is embedded by `build.rs`.
 const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_COMMIT"), ")");
@@ -84,13 +84,13 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Add { path } => {
-            init_tracing();
+            levelup_core::init_tracing("SLEIPNIR_LOG");
             run_add(&path, cli.db.as_deref())
         }
         Cmd::Pick { query } => run_pick(query.join(" "), cli.db.as_deref()),
         Cmd::Query { query, limit } => run_query(&query.join(" "), limit, cli.db.as_deref()),
         Cmd::Sync => {
-            init_tracing();
+            levelup_core::init_tracing("SLEIPNIR_LOG");
             run_sync(cli.db.as_deref())
         }
     }

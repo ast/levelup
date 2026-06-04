@@ -9,6 +9,8 @@ name = "heimdall"
 path = "src/main.rs"
 
 [dependencies]
+levelup-core = { path = "../levelup-core" }
+levelup-tui = { path = "../levelup-tui" }
 anyhow.workspace = true
 clap.workspace = true
 tracing.workspace = true
