@@ -80,9 +80,14 @@ schema-of DB:
 hugin *ARGS:
     cargo run --quiet --bin hugin -p hugin -- {{ARGS}}
 
-# Install hugind + hugin to ~/.cargo/bin (the path dist/hugind.service expects)
+# Install every tool's binaries to ~/.cargo/bin (the paths the dist/*.service units expect)
 install:
     cargo install --path hugin --locked
+    cargo install --path munin --locked
+    cargo install --path mimir --locked
+    cargo install --path sleipnir --locked
+    cargo install --path valkyrie --locked
+    cargo install --path heimdall --locked
 
 # Print hugin CLI completions for SHELL (bash, zsh, fish, elvish, powershell)
 completions-hugin SHELL:
