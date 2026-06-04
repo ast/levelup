@@ -23,9 +23,9 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout as LayoutWidget, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row as TableRow, Table, TableState};
 use rusqlite::Connection;
 
 use crate::actions;
@@ -57,7 +57,7 @@ struct State {
     engine: Engine,
     devices: BTreeMap<Ipv4Addr, Entry>,
     results: Vec<Row>,
-    list_state: ListState,
+    table_state: TableState,
     cidrs: String,
     /// Results of on-demand port scans flow back here.
     ports_tx: Sender<(Ipv4Addr, Vec<u16>)>,
@@ -106,7 +106,7 @@ fn run_loop(
         engine,
         devices: BTreeMap::new(),
         results: Vec::new(),
-        list_state: ListState::default(),
+        table_state: TableState::default(),
         cidrs,
         ports_tx,
         ports_rx,
@@ -215,24 +215,26 @@ impl State {
     }
 
     fn selected_ip(&self) -> Option<Ipv4Addr> {
-        self.list_state
+        self.table_state
             .selected()
             .and_then(|i| self.results.get(i))
             .map(|r| r.device.ip)
     }
 
     fn selected(&self) -> Option<&Row> {
-        self.list_state.selected().and_then(|i| self.results.get(i))
+        self.table_state
+            .selected()
+            .and_then(|i| self.results.get(i))
     }
 
     fn move_selection(&mut self, delta: isize) {
         if self.results.is_empty() {
-            self.list_state.select(None);
+            self.table_state.select(None);
             return;
         }
         let len = self.results.len() as isize;
-        let cur = self.list_state.selected().unwrap_or(0) as isize;
-        self.list_state
+        let cur = self.table_state.selected().unwrap_or(0) as isize;
+        self.table_state
             .select(Some((cur + delta).clamp(0, len - 1) as usize));
     }
 
@@ -290,7 +292,7 @@ impl State {
             } else {
                 Some(0)
             });
-        self.list_state.select(idx);
+        self.table_state.select(idx);
     }
 }
 
@@ -408,21 +410,23 @@ fn delete_word(state: &mut State) {
 fn render(f: &mut ratatui::Frame<'_>, state: &mut State, cfg: &Config) {
     let area = f.area();
     let detail_h = if cfg.preview { 4 } else { 0 };
+    // Bottom-anchored like the sibling tools: list on top, then the detail
+    // strip, with the status/toolbar and search prompt pinned to the bottom.
     let chunks = LayoutWidget::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // prompt
-            Constraint::Length(1), // status
-            Constraint::Min(1),    // list
-            Constraint::Length(detail_h),
+            Constraint::Min(1),           // list
+            Constraint::Length(detail_h), // detail strip
+            Constraint::Length(1),        // status / toolbar
+            Constraint::Length(1),        // search prompt (bottom row)
         ])
         .split(area);
-    render_prompt(f, state, cfg, chunks[0]);
-    render_status(f, state, cfg, chunks[1]);
-    render_list(f, state, cfg, chunks[2]);
+    render_list(f, state, cfg, chunks[0]);
     if detail_h > 0 {
-        render_detail(f, state, cfg, chunks[3]);
+        render_detail(f, state, cfg, chunks[1]);
     }
+    render_status(f, state, cfg, chunks[2]);
+    render_prompt(f, state, cfg, chunks[3]);
 }
 
 fn render_prompt(f: &mut ratatui::Frame<'_>, state: &State, cfg: &Config, area: Rect) {
@@ -463,42 +467,133 @@ fn render_status(f: &mut ratatui::Frame<'_>, state: &State, cfg: &Config, area: 
     f.render_widget(Paragraph::new(line), area);
 }
 
+/// A flexible table: IP/MAC are fixed-width; VENDOR/HOST/SERVICES share the
+/// remaining width (so they expand on a wide terminal and truncate on a narrow
+/// one). A row dims once the device goes quiet, and fuzzy-matched characters in
+/// each cell are highlighted in the match colour — the same search feel as the
+/// sibling tools.
 fn render_list(f: &mut ratatui::Frame<'_>, state: &mut State, cfg: &Config, area: Rect) {
     let now = Instant::now();
     let dim = cfg.colors.status_fg.to_ratatui();
-    let items: Vec<ListItem> = state
+    let matched_style = Style::default()
+        .fg(cfg.colors.match_fg.to_ratatui())
+        .add_modifier(Modifier::BOLD);
+
+    let q = state.query.trim();
+    let pattern = (!q.is_empty()).then(|| {
+        nucleo_matcher::pattern::Pattern::parse(
+            q,
+            nucleo_matcher::pattern::CaseMatching::Smart,
+            nucleo_matcher::pattern::Normalization::Smart,
+        )
+    });
+    let mut matcher = nucleo_matcher::Matcher::new(nucleo_matcher::Config::DEFAULT);
+
+    let header = TableRow::new(["IP", "MAC", "VENDOR", "HOST", "SERVICES"])
+        .style(Style::default().fg(dim).add_modifier(Modifier::BOLD));
+
+    let rows: Vec<TableRow> = state
         .results
         .iter()
-        .map(|r| ListItem::new(render_row(r, now, dim)))
+        .map(|r| {
+            let d = &r.device;
+            let quiet = now.duration_since(r.last_seen).as_secs() > WARN_SECS;
+            let base = if quiet {
+                Style::default().fg(dim)
+            } else {
+                Style::default()
+            };
+            let texts = [
+                d.ip.to_string(),
+                d.mac.clone().unwrap_or_else(|| "-".into()),
+                d.vendor.clone().unwrap_or_else(|| "?".into()),
+                d.hostname.clone().unwrap_or_else(|| "-".into()),
+                d.services.join(", "),
+            ];
+            let cells: Vec<Cell> = texts
+                .iter()
+                .map(|t| {
+                    Cell::from(highlight_cell(
+                        t,
+                        pattern.as_ref(),
+                        &mut matcher,
+                        base,
+                        matched_style,
+                    ))
+                })
+                .collect();
+            TableRow::new(cells)
+        })
         .collect();
-    let list = List::new(items)
-        .highlight_style(
+
+    let widths = [
+        Constraint::Length(15),
+        Constraint::Length(17),
+        Constraint::Fill(2),
+        Constraint::Fill(2),
+        Constraint::Fill(3),
+    ];
+    let table = Table::new(rows, widths)
+        .header(header)
+        .column_spacing(1)
+        .row_highlight_style(
             Style::default()
                 .fg(cfg.colors.selection_fg.to_ratatui())
                 .bg(cfg.colors.selection_bg.to_ratatui())
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("> ");
-    f.render_stateful_widget(list, area, &mut state.list_state);
+    f.render_stateful_widget(table, area, &mut state.table_state);
 }
 
-/// `IP  MAC  VENDOR  HOST  services` — dimmed once the device goes quiet.
-fn render_row(r: &Row, now: Instant, dim: Color) -> Line<'static> {
-    let quiet = now.duration_since(r.last_seen).as_secs() > WARN_SECS;
-    let text = format!(
-        "{:<15} {:<17} {:<20} {:<20} {}",
-        r.device.ip,
-        r.device.mac.as_deref().unwrap_or("-"),
-        clip(r.device.vendor.as_deref().unwrap_or("?"), 20),
-        clip(r.device.hostname.as_deref().unwrap_or("-"), 20),
-        r.device.services.join(","),
-    );
-    let style = if quiet {
-        Style::default().fg(dim)
-    } else {
-        Style::default()
+/// Build a cell `Line`, colouring the query's matched characters in
+/// `matched_style` (the rest in `base`). When the whole query matches *this*
+/// cell, its hit positions light up — so a single-term search (`hue`, `192`,
+/// `ubiquiti`) highlights wherever it lands. Same `Pattern::indices` mechanism
+/// the other tools use.
+fn highlight_cell(
+    text: &str,
+    pattern: Option<&nucleo_matcher::pattern::Pattern>,
+    matcher: &mut nucleo_matcher::Matcher,
+    base: Style,
+    matched_style: Style,
+) -> Line<'static> {
+    let text = sanitize_display(text);
+    let Some(pattern) = pattern else {
+        return Line::from(Span::styled(text, base));
     };
-    Line::from(Span::styled(sanitize_display(&text), style))
+    let mut buf = Vec::new();
+    let mut idx = Vec::new();
+    let hay = nucleo_matcher::Utf32Str::new(&text, &mut buf);
+    if pattern.indices(hay, matcher, &mut idx).is_none() {
+        return Line::from(Span::styled(text, base));
+    }
+    idx.sort_unstable();
+    idx.dedup();
+
+    let mut spans = Vec::new();
+    let mut run = String::new();
+    let mut run_match = false;
+    let mut it = idx.iter().copied().peekable();
+    for (i, c) in text.chars().enumerate() {
+        let is_match = it.peek() == Some(&(i as u32));
+        if is_match {
+            it.next();
+        }
+        if is_match != run_match && !run.is_empty() {
+            let style = if run_match { matched_style } else { base };
+            spans.push(Span::styled(std::mem::take(&mut run), style));
+        }
+        run_match = is_match;
+        run.push(c);
+    }
+    if !run.is_empty() {
+        spans.push(Span::styled(
+            run,
+            if run_match { matched_style } else { base },
+        ));
+    }
+    Line::from(spans)
 }
 
 /// Horizontal detail strip (bottom): everything Heimdall knows about the
@@ -565,14 +660,6 @@ fn flush_cache(cache: &Option<Connection>, devices: &BTreeMap<Ipv4Addr, Entry>) 
         .unwrap_or(0);
     let devs: Vec<(&Device, i64)> = devices.values().map(|e| (&e.device, now_unix)).collect();
     cache::save(c, &devs);
-}
-
-fn clip(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        s.chars().take(max.saturating_sub(1)).collect::<String>() + "…"
-    }
 }
 
 // ---- terminal (sleipnir/valkyrie /dev/tty trick) --------------------------
