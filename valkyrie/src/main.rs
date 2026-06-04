@@ -13,6 +13,7 @@ mod proc;
 mod search;
 mod shells;
 mod signals;
+mod tree;
 mod tui;
 mod util;
 

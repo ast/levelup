@@ -35,7 +35,7 @@ pub struct Process {
     /// `‹…›`-marked `command` when a query matched it; else `None`.
     pub snippet: Option<String>,
     /// utime+stime in clock ticks — kept to diff against the next scan.
-    cpu_jiffies: u64,
+    pub(crate) cpu_jiffies: u64,
 }
 
 #[derive(Default)]

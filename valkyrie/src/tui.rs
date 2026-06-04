@@ -7,6 +7,7 @@
 //! **signal chooser** overlay; and scope/sort toggles. Letters feed the query,
 //! so every action is a Ctrl/Tab/Fn key.
 
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::Write;
 use std::time::{Duration, Instant};
@@ -32,6 +33,7 @@ use crate::config::{self, Config, Layout};
 use crate::proc::{Process, Scanner, current_uid, load_avg};
 use crate::search::{Sort, rank};
 use crate::signals::{self, CURATED, SendResult};
+use crate::tree::{self, TreeMeta};
 use crate::util::sanitize_display;
 
 /// Key/timer poll granularity. Short enough that the hold-to-kill meter and the
@@ -83,6 +85,13 @@ struct State {
     kill_last: Instant,
     status: Option<(String, Instant)>,
     chooser: Option<Chooser>,
+    /// Tree-overview toggle (Ctrl-T). Only takes effect with an empty query.
+    tree: bool,
+    /// User overrides to the auto-collapse rule, by pid.
+    expanded: HashSet<i32>,
+    collapsed: HashSet<i32>,
+    /// Tree decoration parallel to `results` (flat rows when not in tree view).
+    tree_meta: Vec<TreeMeta>,
 }
 
 fn run_loop(
@@ -108,6 +117,10 @@ fn run_loop(
         kill_last: now,
         status: None,
         chooser: None,
+        tree: false,
+        expanded: HashSet::new(),
+        collapsed: HashSet::new(),
+        tree_meta: Vec::new(),
     };
     state.rescan(cfg);
 
@@ -172,28 +185,77 @@ impl State {
 
     /// Re-rank the current snapshot for the query, keeping the selection on the
     /// same pid across refreshes (so a moving list doesn't yank your target).
+    /// The tree overview is shown only for an empty query — searching always
+    /// returns a flat ranked list.
+    fn tree_active(&self) -> bool {
+        self.tree && self.query.trim().is_empty()
+    }
+
     fn refresh_results(&mut self, cfg: &Config) {
         let keep_pid = self.selected().map(|p| p.pid);
-        let mut results = rank(self.snapshot.clone(), &self.query, self.sort);
+        let (mut results, mut meta) = if self.tree_active() {
+            tree::build(&self.snapshot, self.sort, &self.expanded, &self.collapsed)
+        } else {
+            let r = rank(self.snapshot.clone(), &self.query, self.sort);
+            let m = r
+                .iter()
+                .map(|p| TreeMeta::flat(p.cpu_pct, p.rss_kb))
+                .collect();
+            (r, m)
+        };
         results.truncate(cfg.limit);
-        if matches!(cfg.layout, Layout::Bottom) {
+        meta.truncate(cfg.limit);
+        // fzf-style reversal only for the flat bottom layout; a tree reads
+        // top-down (roots first), so leave it un-reversed.
+        let reversed = matches!(cfg.layout, Layout::Bottom) && !self.tree_active();
+        if reversed {
             results.reverse();
+            meta.reverse();
         }
         self.results = results;
+        self.tree_meta = meta;
 
+        let default_idx = if self.results.is_empty() {
+            None
+        } else if reversed {
+            Some(self.results.len() - 1)
+        } else {
+            Some(0)
+        };
         let idx = keep_pid
             .and_then(|pid| self.results.iter().position(|p| p.pid == pid))
-            .or_else(|| self.best_index());
+            .or(default_idx);
         *self.list_state.offset_mut() = 0;
         self.list_state.select(idx);
     }
 
-    /// The default selection (best match nearest the prompt).
-    fn best_index(&self) -> Option<usize> {
-        if self.results.is_empty() {
-            None
-        } else {
-            Some(self.results.len() - 1) // Bottom layout; Top would be 0
+    fn collapse_selected(&mut self, cfg: &Config) {
+        let Some(i) = self.list_state.selected() else {
+            return;
+        };
+        let expandable = self.tree_meta.get(i).is_some_and(|m| m.marker.is_some());
+        let Some(pid) = self.results.get(i).map(|p| p.pid) else {
+            return;
+        };
+        if expandable {
+            self.expanded.remove(&pid);
+            self.collapsed.insert(pid);
+            self.refresh_results(cfg);
+        }
+    }
+
+    fn expand_selected(&mut self, cfg: &Config) {
+        let Some(i) = self.list_state.selected() else {
+            return;
+        };
+        let expandable = self.tree_meta.get(i).is_some_and(|m| m.marker.is_some());
+        let Some(pid) = self.results.get(i).map(|p| p.pid) else {
+            return;
+        };
+        if expandable {
+            self.collapsed.remove(&pid);
+            self.expanded.insert(pid);
+            self.refresh_results(cfg);
         }
     }
 
@@ -288,6 +350,10 @@ fn handle_key(key: KeyEvent, state: &mut State, cfg: &Config) -> bool {
         }
         KeyCode::Char('l') if ctrl => state.rescan(cfg),
         KeyCode::Char('v') if ctrl => state.show_preview = !state.show_preview,
+        KeyCode::Char('t') if ctrl => {
+            state.tree = !state.tree;
+            state.refresh_results(cfg);
+        }
 
         // ---- list navigation -------------------------------------------
         KeyCode::Up => state.move_selection(-1),
@@ -298,8 +364,22 @@ fn handle_key(key: KeyEvent, state: &mut State, cfg: &Config) -> bool {
         KeyCode::PageDown => state.move_selection(10),
 
         // ---- query cursor / editing (readline subset) ------------------
-        KeyCode::Left => state.cursor = prev_off(&state.query, state.cursor),
-        KeyCode::Right => state.cursor = next_off(&state.query, state.cursor),
+        // In the tree overview (empty query) ←/→ collapse/expand the selected
+        // node; otherwise they move the query cursor.
+        KeyCode::Left => {
+            if state.tree_active() {
+                state.collapse_selected(cfg);
+            } else {
+                state.cursor = prev_off(&state.query, state.cursor);
+            }
+        }
+        KeyCode::Right => {
+            if state.tree_active() {
+                state.expand_selected(cfg);
+            } else {
+                state.cursor = next_off(&state.query, state.cursor);
+            }
+        }
         KeyCode::Char('b') if ctrl => state.cursor = prev_off(&state.query, state.cursor),
         KeyCode::Char('f') if ctrl => state.cursor = next_off(&state.query, state.cursor),
         KeyCode::Char('a') if ctrl => state.cursor = 0,
@@ -474,10 +554,12 @@ fn render(f: &mut ratatui::Frame<'_>, state: &mut State, cfg: &Config) {
 fn render_list(f: &mut ratatui::Frame<'_>, state: &mut State, cfg: &Config, area: Rect) {
     let match_fg = cfg.colors.match_fg.to_ratatui();
     let label_fg = cfg.colors.status_fg.to_ratatui();
+    let tree = state.tree_active();
     let items: Vec<ListItem> = state
         .results
         .iter()
-        .map(|p| ListItem::new(render_row(p, match_fg, label_fg)))
+        .zip(state.tree_meta.iter())
+        .map(|(p, m)| ListItem::new(render_row(p, m, tree, match_fg, label_fg)))
         .collect();
     let item_count = items.len() as u16;
     let list = List::new(items)
@@ -503,14 +585,22 @@ fn render_list(f: &mut ratatui::Frame<'_>, state: &mut State, cfg: &Config, area
 }
 
 /// `  PID USER   %CPU    RSS S command` — columns in the label colour, the
-/// state cell coloured by state, the command highlighted on a match.
-fn render_row(p: &Process, match_fg: Color, label_fg: Color) -> Line<'static> {
+/// state cell coloured by state, the command highlighted on a match. In tree
+/// view the command is indented by depth with a `▸/▾` marker, %CPU/RSS show the
+/// rolled-up subtree totals, and a collapsed node carries a `+N` hidden count.
+fn render_row(
+    p: &Process,
+    m: &TreeMeta,
+    tree: bool,
+    match_fg: Color,
+    label_fg: Color,
+) -> Line<'static> {
     let cols = format!(
         "{:>7} {:<10} {:>5.1} {:>8} ",
         p.pid,
         truncate(&p.user, 10),
-        p.cpu_pct,
-        human_kb(p.rss_kb),
+        m.cpu_roll,
+        human_kb(m.rss_roll),
     );
     let mut spans = vec![
         Span::styled(cols, Style::default().fg(label_fg)),
@@ -519,6 +609,22 @@ fn render_row(p: &Process, match_fg: Color, label_fg: Color) -> Line<'static> {
             Style::default().fg(state_color(p.state)),
         ),
     ];
+    if tree {
+        let depth = (m.depth as usize).min(10);
+        if depth > 0 {
+            spans.push(Span::raw("  ".repeat(depth)));
+        }
+        match m.marker {
+            Some(c) => spans.push(Span::styled(format!("{c} "), Style::default().fg(label_fg))),
+            None => spans.push(Span::raw("  ")),
+        }
+        if m.count > 0 {
+            spans.push(Span::styled(
+                format!("+{} ", m.count),
+                Style::default().fg(label_fg),
+            ));
+        }
+    }
     match p.snippet.as_deref() {
         Some(snip) => spans.extend(highlight_snippet(snip, match_fg)),
         None => spans.push(Span::raw(sanitize_display(&p.command))),
@@ -585,9 +691,15 @@ fn render_status(f: &mut ratatui::Frame<'_>, state: &State, cfg: &Config, area: 
 
 fn hint_line(state: &State, dim: Style) -> Line<'static> {
     let scope = if state.scope_mine { "mine" } else { "all" };
+    // In tree view the fold keys are the relevant news; otherwise the action set.
+    let nav = if state.tree_active() {
+        "←/→ fold · ^T flat"
+    } else {
+        "^Z stop · hold M-k kill · Tab signal · ^O scope · ^R sort · ^T tree"
+    };
     Line::from(Span::styled(
         format!(
-            " {n} procs · sort:{sort} · scope:{scope} · Enter term · ^Z stop · hold M-k kill · Tab signal · ^O scope · ^R sort · ^V detail · Esc",
+            " {n} procs · sort:{sort} · scope:{scope} · Enter term · {nav} · ^V detail · Esc",
             n = state.results.len(),
             sort = state.sort.label(),
         ),
