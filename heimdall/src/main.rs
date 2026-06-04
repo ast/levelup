@@ -15,10 +15,13 @@ mod util;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+/// `"<pkgver> (<git-commit>)"` — the git commit is embedded by `build.rs`.
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_COMMIT"), ")");
+
 #[derive(Parser)]
 #[command(
     name = "heimdall",
-    version,
+    version = VERSION,
     about = "Rootless LAN device finder — see who's on your network right now"
 )]
 struct Cli {

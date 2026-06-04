@@ -13,7 +13,7 @@ use hugin::tui::{self, Outcome};
 use hugin::{config, default_socket_path, fmt_ts, human_size, sanitize_display, storage};
 
 #[derive(Parser)]
-#[command(name = "hugin", version, about = "Query the hugin clipboard daemon")]
+#[command(name = "hugin", version = hugin::VERSION, about = "Query the hugin clipboard daemon")]
 struct Cli {
     /// Override the daemon socket path. Default: $XDG_RUNTIME_DIR/hugin.sock
     #[arg(long, value_name = "PATH")]

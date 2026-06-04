@@ -27,10 +27,13 @@ use crate::search::{Sort, rank};
 use crate::shells::Shell;
 use crate::util::sanitize_display;
 
+/// `"<pkgver> (<git-commit>)"` — the git commit is embedded by `build.rs`.
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_COMMIT"), ")");
+
 #[derive(Parser)]
 #[command(
     name = "valkyrie",
-    version,
+    version = VERSION,
     about = "Modeless, humane process finder/handler — the chooser of the slain"
 )]
 struct Cli {

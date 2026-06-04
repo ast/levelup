@@ -19,7 +19,7 @@ use munin::{current_hostname, default_socket_path, fmt_dur, now_unix_ns, sanitiz
 #[derive(Parser)]
 #[command(
     name = "munin",
-    version,
+    version = munin::VERSION,
     about = "Query the munin shell-history daemon"
 )]
 struct Cli {

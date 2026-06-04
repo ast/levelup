@@ -7,7 +7,7 @@ use crate::default_socket_path;
 use crate::storage::default_db_path;
 
 #[derive(Debug, Parser)]
-#[command(name = "munind", version, about = "Shell-history capture daemon")]
+#[command(name = "munind", version = crate::VERSION, about = "Shell-history capture daemon")]
 pub struct DaemonArgs {
     /// SQLite database path. Defaults to $XDG_DATA_HOME/munin/munin.db.
     #[arg(long, value_name = "PATH")]

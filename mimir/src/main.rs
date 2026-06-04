@@ -17,8 +17,11 @@ use mimir::config::{self, Config};
 use mimir::protocol::{self, ClickEvent};
 use mimir::{init_tracing, render};
 
+/// `"<pkgver> (<git-commit>)"` — the git commit is embedded by `build.rs`.
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_COMMIT"), ")");
+
 #[derive(Parser)]
-#[command(name = "mimir", version, about = "A compact status bar for sway")]
+#[command(name = "mimir", version = VERSION, about = "A compact status bar for sway")]
 struct Cli {
     /// Config path. Default: $XDG_CONFIG_HOME/mimir/config.toml
     #[arg(long, value_name = "PATH")]

@@ -8,7 +8,7 @@ use crate::default_socket_path;
 use crate::storage::{RetentionConfig, default_db_path};
 
 #[derive(Debug, Parser)]
-#[command(name = "hugind", version, about = "Wayland clipboard manager daemon")]
+#[command(name = "hugind", version = crate::VERSION, about = "Wayland clipboard manager daemon")]
 pub struct DaemonArgs {
     /// SQLite database path. Defaults to $XDG_DATA_HOME/hugin/hugin.db.
     #[arg(long, value_name = "PATH")]

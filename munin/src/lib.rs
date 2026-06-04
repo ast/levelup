@@ -6,6 +6,9 @@ pub mod shells;
 pub mod storage;
 pub mod tui;
 
+/// `"<pkgver> (<git-commit>)"` — the git commit is embedded by `build.rs`.
+pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_COMMIT"), ")");
+
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 

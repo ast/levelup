@@ -28,10 +28,13 @@ use crate::storage::{Kind, Row, default_db_path};
 use crate::tui::Outcome;
 use crate::util::{init_tracing, now_unix_secs};
 
+/// `"<pkgver> (<git-commit>)"` — the git commit is embedded by `build.rs`.
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_COMMIT"), ")");
+
 #[derive(Parser)]
 #[command(
     name = "sleipnir",
-    version,
+    version = VERSION,
     about = "Modeless frecency navigator — jump to the dirs and files you actually use"
 )]
 struct Cli {
