@@ -9,6 +9,7 @@ members = [
     "sleipnir",
     "valkyrie",
     "heimdall",
+    "gorm",
 ]
 
 [workspace.package]
@@ -45,6 +46,9 @@ syntect = { version = "5", default-features = false, features = ["default-fancy"
 if-addrs = "0.13"
 mac_oui = { version = "0.4", features = ["with-db"] }
 mdns-sd = "0.11"
+# Bluetooth device management (gorm): typed BlueZ binding over D-Bus. Links
+# libdbus via the `dbus` crate, so building needs `libdbus-1-dev` + pkg-config.
+bluer = { version = "0.17", features = ["bluetoothd"] }
 
 [profile.release]
 lto = "thin"
