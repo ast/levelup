@@ -7,6 +7,7 @@
 mod config;
 mod device;
 mod engine;
+mod oui;
 mod tui;
 
 use anyhow::{Context, Result};
@@ -69,8 +70,8 @@ fn run_scan() -> Result<()> {
     let devices = rt.block_on(engine::scan_once())?;
 
     println!(
-        "{:<17} {:<12} {:>5} {:>5} {:<16} NAME",
-        "ADDRESS", "STATE", "RSSI", "BATT", "TYPE"
+        "{:<17} {:<12} {:>5} {:>5} {:<16} {:<18} NAME",
+        "ADDRESS", "STATE", "RSSI", "BATT", "TYPE", "VENDOR"
     );
     for d in &devices {
         let mut state = d.state_label().to_string();
@@ -78,7 +79,7 @@ fn run_scan() -> Result<()> {
             state.push_str(" ✓");
         }
         println!(
-            "{:<17} {:<12} {:>5} {:>5} {:<16} {}",
+            "{:<17} {:<12} {:>5} {:>5} {:<16} {:<18} {}",
             d.address,
             state,
             d.rssi.map(|r| r.to_string()).unwrap_or_else(|| "-".into()),
@@ -86,6 +87,7 @@ fn run_scan() -> Result<()> {
                 .map(|b| format!("{b}%"))
                 .unwrap_or_else(|| "-".into()),
             d.icon.as_deref().unwrap_or("-"),
+            d.vendor.as_deref().unwrap_or("-"),
             d.name.as_deref().unwrap_or("(unknown)"),
         );
     }

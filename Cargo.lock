@@ -826,6 +826,7 @@ dependencies = [
  "crossterm",
  "levelup-core",
  "levelup-tui",
+ "mac_oui",
  "nucleo-matcher",
  "ratatui",
  "serde",

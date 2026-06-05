@@ -591,7 +591,7 @@ fn render_list(f: &mut ratatui::Frame<'_>, state: &mut State, cfg: &Config, area
     let pattern = (!q.is_empty()).then(|| fuzzy::pattern(q));
     let mut matcher = fuzzy::matcher();
 
-    let header = TableRow::new(["NAME", "TYPE", "SIG", "BATT", "STATE", "ADDRESS"])
+    let header = TableRow::new(["NAME", "TYPE", "VENDOR", "SIG", "BATT", "STATE", "ADDRESS"])
         .style(Style::default().fg(dim).add_modifier(Modifier::BOLD));
 
     let rows: Vec<TableRow> = state
@@ -607,12 +607,14 @@ fn render_list(f: &mut ratatui::Frame<'_>, state: &mut State, cfg: &Config, area
             };
             let name = d.name.clone().unwrap_or_else(|| "(unknown)".into());
             let icon = d.icon.clone().unwrap_or_else(|| "-".into());
+            let vendor = d.vendor.clone().unwrap_or_else(|| "·".into());
             let cell = |t: &str, m: &mut nucleo_matcher::Matcher| {
                 Cell::from(highlight_cell(t, pattern.as_ref(), m, base, matched_style))
             };
             TableRow::new(vec![
                 cell(&name, &mut matcher),
                 cell(&icon, &mut matcher),
+                cell(&vendor, &mut matcher),
                 Cell::from(Span::styled(signal_cell(d.rssi), base)),
                 Cell::from(Span::styled(
                     d.battery
@@ -628,6 +630,7 @@ fn render_list(f: &mut ratatui::Frame<'_>, state: &mut State, cfg: &Config, area
 
     let widths = [
         Constraint::Fill(3),
+        Constraint::Fill(2),
         Constraint::Fill(2),
         Constraint::Length(4),
         Constraint::Length(4),
@@ -753,6 +756,10 @@ fn render_detail(f: &mut ratatui::Frame<'_>, state: &State, cfg: &Config, area: 
     l1.push(Span::styled("   type ", dim));
     l1.push(Span::raw(sanitize_display(
         d.icon.as_deref().unwrap_or("-"),
+    )));
+    l1.push(Span::styled("   vendor ", dim));
+    l1.push(Span::raw(sanitize_display(
+        d.vendor.as_deref().unwrap_or("—"),
     )));
 
     let mut l2 = pair("paired", yn(d.paired).into());

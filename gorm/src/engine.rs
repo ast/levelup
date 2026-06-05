@@ -20,6 +20,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::warn;
 
 use crate::device::{BtDevice, Cmd, Fact, Prompt, PromptKind};
+use crate::oui::Vendors;
 
 /// How often we re-read the adapter's devices.
 const POLL: Duration = Duration::from_millis(1000);
@@ -75,6 +76,10 @@ async fn run(fact_tx: &UnboundedSender<Fact>, mut cmd_rx: UnboundedReceiver<Cmd>
         name: adapter.name().to_string(),
     });
 
+    // Load the OUI database once (vendor lookups by MAC); cheap to skip if it
+    // can't be loaded.
+    let vendors = Vendors::load();
+
     // Register our pairing agent so passkey/confirmation requests surface in
     // the TUI. The handle must stay alive for the agent to remain registered.
     let reply_slot: ReplySlot = Arc::new(Mutex::new(None));
@@ -93,7 +98,7 @@ async fn run(fact_tx: &UnboundedSender<Fact>, mut cmd_rx: UnboundedReceiver<Cmd>
     let inflight = Arc::new(AtomicUsize::new(0));
     let mut ticker = tokio::time::interval(POLL);
 
-    let _ = fact_tx.send(Fact::Snapshot(read_all(&adapter).await));
+    let _ = fact_tx.send(Fact::Snapshot(read_all(&adapter, vendors.as_ref()).await));
 
     loop {
         tokio::select! {
@@ -129,7 +134,10 @@ async fn run(fact_tx: &UnboundedSender<Fact>, mut cmd_rx: UnboundedReceiver<Cmd>
                 if discovery.is_none() && inflight.load(Ordering::SeqCst) == 0 {
                     discovery = start_discovery(&adapter).await;
                 }
-                if fact_tx.send(Fact::Snapshot(read_all(&adapter).await)).is_err() {
+                if fact_tx
+                    .send(Fact::Snapshot(read_all(&adapter, vendors.as_ref()).await))
+                    .is_err()
+                {
                     break; // TUI gone
                 }
             }
@@ -323,7 +331,7 @@ async fn ready_adapter(session: &bluer::Session) -> Result<bluer::Adapter> {
 
 /// Read every device the adapter knows into our model. Per-device property
 /// reads that fail are treated as "unknown" rather than aborting the snapshot.
-pub async fn read_all(adapter: &bluer::Adapter) -> Vec<BtDevice> {
+pub async fn read_all(adapter: &bluer::Adapter, vendors: Option<&Vendors>) -> Vec<BtDevice> {
     let mut devices = Vec::new();
     let addrs = match adapter.device_addresses().await {
         Ok(a) => a,
@@ -336,17 +344,18 @@ pub async fn read_all(adapter: &bluer::Adapter) -> Vec<BtDevice> {
         let Ok(dev) = adapter.device(addr) else {
             continue;
         };
+        let addr_str = addr.to_string();
         // BlueZ defaults a nameless device's alias to its dashed address
         // (e.g. `6B-73-4B-81-C5-59`); treat that as "no name" so the ranking
         // can tell identifiable devices from anonymous beacons and the NAME
         // column doesn't just echo the address.
-        let addr_dash = addr.to_string().replace(':', "-");
         let name = match dev.alias().await {
-            Ok(a) if !a.is_empty() && a != addr_dash => Some(a),
+            Ok(a) if !a.is_empty() && a != addr_str.replace(':', "-") => Some(a),
             _ => dev.name().await.ok().flatten(),
         };
+        let vendor = vendors.and_then(|v| v.lookup(&addr_str));
         devices.push(BtDevice {
-            address: addr.to_string(),
+            address: addr_str,
             name,
             paired: dev.is_paired().await.unwrap_or(false),
             connected: dev.is_connected().await.unwrap_or(false),
@@ -354,6 +363,7 @@ pub async fn read_all(adapter: &bluer::Adapter) -> Vec<BtDevice> {
             blocked: dev.is_blocked().await.unwrap_or(false),
             rssi: dev.rssi().await.ok().flatten(),
             icon: dev.icon().await.ok().flatten(),
+            vendor,
             battery: dev.battery_percentage().await.ok().flatten(),
         });
     }
@@ -366,5 +376,6 @@ pub async fn scan_once() -> Result<Vec<BtDevice>> {
         .await
         .context("connect to BlueZ over D-Bus")?;
     let adapter = ready_adapter(&session).await?;
-    Ok(read_all(&adapter).await)
+    let vendors = Vendors::load();
+    Ok(read_all(&adapter, vendors.as_ref()).await)
 }

@@ -21,6 +21,8 @@ pub struct BtDevice {
     pub rssi: Option<i16>,
     /// BlueZ icon hint for the device class, e.g. `audio-headset`, `input-mouse`.
     pub icon: Option<String>,
+    /// Manufacturer from the MAC's OUI (None for random/private addresses).
+    pub vendor: Option<String>,
     /// Battery level 0–100 when the device exposes it.
     pub battery: Option<u8>,
 }
@@ -39,17 +41,21 @@ impl BtDevice {
         }
     }
 
-    /// The string nucleo matches against in the picker — name, address, and
-    /// device type fused into one content space.
+    /// The string nucleo matches against in the picker — name, address, device
+    /// type, and vendor fused into one content space (type any of them to
+    /// filter, e.g. `sony`).
     pub fn haystack(&self) -> String {
         let mut s = self.address.clone();
-        if let Some(name) = &self.name {
+        for part in [
+            self.name.as_deref(),
+            self.icon.as_deref(),
+            self.vendor.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
             s.push(' ');
-            s.push_str(name);
-        }
-        if let Some(icon) = &self.icon {
-            s.push(' ');
-            s.push_str(icon);
+            s.push_str(part);
         }
         s
     }
