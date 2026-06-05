@@ -58,6 +58,43 @@ pub fn fmt_dur(ms: Option<i64>) -> String {
     }
 }
 
+/// Compact relative age for a picker row: `"now"` / `"5s"` / `"3m"` / `"2h"` /
+/// `"4d"` / `"2w"` / `"3mo"` / `"1y"`. `now_unix_ns` is passed in so a whole
+/// frame of rows shares one clock read and stays consistent. Sibling to
+/// `fmt_dur`; the TUI's row renderer uses it.
+pub fn fmt_ago(now_unix_ns: i64, ts_unix_ns: i64) -> String {
+    let secs = (now_unix_ns - ts_unix_ns) / 1_000_000_000;
+    if secs < 0 {
+        // Clock skew or a future-stamped row — don't print a negative age.
+        return "now".into();
+    }
+    const MINUTE: i64 = 60;
+    const HOUR: i64 = 60 * MINUTE;
+    const DAY: i64 = 24 * HOUR;
+    const WEEK: i64 = 7 * DAY;
+    const MONTH: i64 = 30 * DAY;
+    const YEAR: i64 = 365 * DAY;
+    if secs < MINUTE {
+        if secs == 0 {
+            "now".into()
+        } else {
+            format!("{secs}s")
+        }
+    } else if secs < HOUR {
+        format!("{}m", secs / MINUTE)
+    } else if secs < DAY {
+        format!("{}h", secs / HOUR)
+    } else if secs < WEEK {
+        format!("{}d", secs / DAY)
+    } else if secs < MONTH {
+        format!("{}w", secs / WEEK)
+    } else if secs < YEAR {
+        format!("{}mo", secs / MONTH)
+    } else {
+        format!("{}y", secs / YEAR)
+    }
+}
+
 /// Make arbitrary stored text safe to print to a terminal. Stored commands can
 /// contain raw control bytes (bracketed-paste markers from imports, escape
 /// sequences from pasted input) that would otherwise *drive* the terminal —
@@ -96,5 +133,28 @@ mod tests {
         assert_eq!(fmt_dur(Some(3_400)), "3.4s"); // sub-minute → seconds
         assert_eq!(fmt_dur(Some(83_000)), "1m23s"); // ≥1min → m+s, zero-padded
         assert_eq!(fmt_dur(Some(3_600_000)), "60m00s");
+    }
+
+    #[test]
+    fn fmt_ago_buckets() {
+        const S: i64 = 1_000_000_000; // one second in ns
+        // `now` is the reference clock; `ts` is `n` seconds before it.
+        let ago = |secs_before: i64| fmt_ago(1_000 * S, 1_000 * S - secs_before * S);
+        assert_eq!(ago(0), "now");
+        assert_eq!(ago(5), "5s");
+        assert_eq!(ago(59), "59s");
+        assert_eq!(ago(60), "1m");
+        assert_eq!(ago(3_599), "59m");
+        assert_eq!(ago(3_600), "1h");
+        assert_eq!(ago(86_399), "23h");
+        assert_eq!(ago(86_400), "1d");
+        assert_eq!(ago(6 * 86_400), "6d");
+        assert_eq!(ago(7 * 86_400), "1w");
+        assert_eq!(ago(29 * 86_400), "4w"); // < 30d still weeks
+        assert_eq!(ago(30 * 86_400), "1mo");
+        assert_eq!(ago(364 * 86_400), "12mo");
+        assert_eq!(ago(365 * 86_400), "1y");
+        // A future-stamped row (clock skew) clamps to "now", never negative.
+        assert_eq!(fmt_ago(1_000 * S, 1_005 * S), "now");
     }
 }

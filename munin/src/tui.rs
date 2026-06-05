@@ -30,7 +30,7 @@ use rusqlite::Connection;
 use crate::config::{Config, Layout};
 use crate::proto::{EntryMeta, Filters, SearchSort};
 use crate::storage;
-use crate::{fmt_dur, sanitize_display};
+use crate::{fmt_ago, fmt_dur, now_unix_ns, sanitize_display};
 
 /// What the user did. The bin layer maps each variant to a different exit
 /// code so the shell hook can distinguish "run this" from "drop this on the
@@ -372,10 +372,13 @@ fn render(f: &mut ratatui::Frame<'_>, state: &mut State, cfg: &Config) {
 
 fn render_list(f: &mut ratatui::Frame<'_>, state: &mut State, cfg: &Config, area: Rect) {
     let match_fg = cfg.colors.match_fg.to_ratatui();
+    // One clock read for the whole frame so every row's "time ago" is computed
+    // against the same instant.
+    let now = now_unix_ns();
     let items: Vec<ListItem> = state
         .results
         .iter()
-        .map(|e| ListItem::new(render_row(e, match_fg)))
+        .map(|e| ListItem::new(render_row(e, now, match_fg)))
         .collect();
     let item_count = items.len() as u16;
     let list = List::new(items)
@@ -407,14 +410,19 @@ fn render_list(f: &mut ratatui::Frame<'_>, state: &mut State, cfg: &Config, area
     f.render_stateful_widget(list, list_area, &mut state.list_state);
 }
 
-/// One row: `<exit>  <duration>  <cmd-with-‹match›-highlights>`.
-fn render_row(entry: &EntryMeta, match_fg: ratatui::style::Color) -> Line<'static> {
+/// One row: `<exit>  <duration>  <ago>  <cmd-with-‹match›-highlights>`.
+fn render_row(
+    entry: &EntryMeta,
+    now_unix_ns: i64,
+    match_fg: ratatui::style::Color,
+) -> Line<'static> {
     let exit = entry
         .exit_code
         .map(|c| format!("{c:>3}"))
         .unwrap_or_else(|| "  -".into());
     let dur = fmt_dur(entry.duration_ms);
-    let mut spans = vec![Span::raw(format!("{exit}  {dur:>6}  "))];
+    let ago = fmt_ago(now_unix_ns, entry.ts_unix_ns);
+    let mut spans = vec![Span::raw(format!("{exit}  {dur:>6}  {ago:>4}  "))];
     // Search results carry a snippet with `‹›` markers. Walk the snippet and
     // colour the matched runs. List/get results (no snippet) just show cmd.
     if let Some(snippet) = entry.snippet.as_deref() {

@@ -778,4 +778,3 @@ fn render_preview(f: &mut ratatui::Frame<'_>, state: &State, cfg: &Config, area:
     let p = Paragraph::new(body).block(block).wrap(Wrap { trim: false });
     f.render_widget(p, area);
 }
-

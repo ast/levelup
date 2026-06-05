@@ -469,8 +469,20 @@ pub fn search(
         }
     }
 
+    // Dedup identical commands, keeping the most-recent occurrence. The sort
+    // above already places that first among byte-identical commands (Relevance:
+    // equal score → id desc; Recent: id desc), so keeping the first survivor of
+    // each `cmd` is the newest run — its exit code / duration / timestamp. Dedup
+    // happens before `take(limit)` so duplicates don't eat the budget. Only the
+    // query path dedups; the empty-query branch returned `list()` untouched.
     let limit = limit.min(MAX_LIMIT);
-    Ok(scored.into_iter().take(limit).map(|(_, e)| e).collect())
+    let mut seen = std::collections::HashSet::new();
+    Ok(scored
+        .into_iter()
+        .filter(|(_, e)| seen.insert(e.cmd.clone()))
+        .take(limit)
+        .map(|(_, e)| e)
+        .collect())
 }
 
 pub fn get(conn: &Connection, id: i64) -> Result<Option<EntryMeta>> {
@@ -811,6 +823,66 @@ mod tests {
                 .add_start("  secret", "sess", 1_700_000_000 * SEC_NS, None, None, None)
                 .unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn search_dedups_identical_commands_keeping_most_recent() {
+        let db = TempDb::new();
+        let store = Store::open(db.path()).unwrap();
+        let t0 = 1_700_000_000 * SEC_NS;
+
+        // Three runs of the same command at increasing timestamps, plus a
+        // distinct variant in between.
+        let _id1 = store
+            .add_start("git add .", "s", t0, None, None, Some("zsh"))
+            .unwrap()
+            .unwrap();
+        let _id2 = store
+            .add_start("git add .", "s", t0 + SEC_NS, None, None, Some("zsh"))
+            .unwrap()
+            .unwrap();
+        let id_variant = store
+            .add_start("git add -p", "s", t0 + 2 * SEC_NS, None, None, Some("zsh"))
+            .unwrap()
+            .unwrap();
+        let id_newest = store
+            .add_start("git add .", "s", t0 + 3 * SEC_NS, None, None, Some("zsh"))
+            .unwrap()
+            .unwrap();
+
+        let conn = Connection::open(db.path()).unwrap();
+        let filters = Filters::default();
+
+        // Search dedups: one row per distinct command.
+        let hits = search(&conn, "git add", SearchSort::Recent, 100, &filters).unwrap();
+        assert_eq!(
+            hits.iter().filter(|e| e.cmd == "git add .").count(),
+            1,
+            "identical commands collapse to one row"
+        );
+        // The surviving `git add .` is the most-recent run (newest id).
+        let survivor = hits.iter().find(|e| e.cmd == "git add .").unwrap();
+        assert_eq!(survivor.id, id_newest);
+        // The distinct variant is still present.
+        assert!(
+            hits.iter()
+                .any(|e| e.id == id_variant && e.cmd == "git add -p")
+        );
+
+        // `list` (and the empty-query search path) keeps every row, duplicates
+        // included — the recency view is un-deduped.
+        let all = list(&conn, 100, &filters).unwrap();
+        assert_eq!(
+            all.iter().filter(|e| e.cmd == "git add .").count(),
+            3,
+            "list keeps all duplicate executions"
+        );
+        let empty = search(&conn, "   ", SearchSort::Recent, 100, &filters).unwrap();
+        assert_eq!(
+            empty.iter().filter(|e| e.cmd == "git add .").count(),
+            3,
+            "empty query falls through to list — no dedup"
         );
     }
 }
