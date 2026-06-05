@@ -12,7 +12,8 @@ mod discover;
 mod tui;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use levelup_core::completions::Shell as CompletionShell;
 
 /// `"<pkgver> (<git-commit>)"` — the git commit is embedded by `build.rs`.
 const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_COMMIT"), ")");
@@ -34,6 +35,12 @@ enum Cmd {
     Scan,
     /// Print a shell alias snippet (`eval "$(heimdall init)"`).
     Init,
+    /// Print a shell-completion script to stdout. SHELL defaults to $SHELL.
+    #[command(visible_alias = "comp")]
+    Completions {
+        #[arg(value_enum)]
+        shell: Option<CompletionShell>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -46,6 +53,9 @@ fn main() -> Result<()> {
         Some(Cmd::Scan) => {
             levelup_core::init_tracing("HEIMDALL_LOG");
             run_scan()
+        }
+        Some(Cmd::Completions { shell }) => {
+            levelup_core::completions::print(&mut Cli::command(), "heimdall", shell)
         }
         // No subcommand → the live interactive picker.
         None => tui::run(),

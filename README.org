@@ -52,16 +52,24 @@ install -Dm755 target/release/munind ~/.local/bin/munind
 install -Dm755 target/release/munin  ~/.local/bin/munin
 #+end_src
 
-Then install the systemd user unit so =munind= runs in the background:
+That's the whole install — there is no systemd unit to set up. The =munin= CLI owns the daemon's lifecycle: any command that needs =munind= (currently =import=, and sync later) starts it automatically and race-free, so it "just works". You can also drive it explicitly:
 
 #+begin_src sh
-install -Dm644 dist/munind.service ~/.config/systemd/user/munind.service
-systemctl --user daemon-reload
-systemctl --user enable --now munind
-systemctl --user status munind        # should show "active (running)"
+munin daemon start     # start it now (idempotent — no-op if already up)
+munin daemon status    # running? pid, uptime, db + socket paths
+munin daemon stop      # graceful shutdown
+munin daemon restart   # stop (if up) then start fresh, e.g. after upgrading
+munin daemon ping      # liveness probe: "ok" / "not running" (exit 1); never starts it
 #+end_src
 
-The daemon listens on =$XDG_RUNTIME_DIR/munin.sock= and writes to =$XDG_DATA_HOME/munin/munin.db= (default =~/.local/share/munin/munin.db=).
+The daemon listens on =$XDG_RUNTIME_DIR/munin.sock=, writes to =$XDG_DATA_HOME/munin/munin.db= (default =~/.local/share/munin/munin.db=), and logs to =$XDG_STATE_HOME/munin/munind.log= (default =~/.local/state/munin/munind.log=) when auto-started.
+
+*Migrating from a previous systemd setup:* earlier versions shipped a =munind.service= user unit. If you enabled it, disable it so systemd and the CLI don't both manage the daemon:
+
+#+begin_src sh
+systemctl --user disable --now munind
+rm -f ~/.config/systemd/user/munind.service
+#+end_src
 
 ** Shell setup
 
@@ -88,6 +96,14 @@ This wires up two things:
 The TUI bypasses the daemon and reads SQLite directly, so it works even if =munind= is down.
 
 *Bash caveat:* =bind -x= (the only way to wire a Rust binary into readline) cannot trigger Enter from inside the bound function. On bash, both Enter and Tab in the picker land the chosen command on the prompt and you hit Enter yourself to run it. zsh honours the run/edit distinction natively.
+
+*Shell completions* (optional) — =munin completions [SHELL]= prints a completion script to stdout (=clap_complete=). SHELL defaults to =$SHELL=; pass one explicitly for any of bash/zsh/fish/elvish/powershell:
+
+#+begin_src sh
+munin completions zsh  > ~/.zfunc/_munin            # then ensure ~/.zfunc is on $fpath
+munin completions bash > ~/.local/share/bash-completion/completions/munin
+munin completions fish > ~/.config/fish/completions/munin.fish
+#+end_src
 
 ** Importing existing history
 
@@ -137,26 +153,28 @@ Colours accept the named ANSI palette (=black=/=red=/.../=gray=/=darkgray=/=ligh
 
 ** Daemon vs CLI — what needs the daemon
 
-Only writes and the liveness probe go through =munind=:
+Captures and reads all open SQLite directly, so they work whether or not =munind= is running. Only bulk =import=, the liveness probe, and the daemon-control ops use the socket — and those start the daemon on demand:
 
-| Command                             | Path            | Needs daemon? |
-|-------------------------------------+-----------------+---------------|
-| =munin add-start= / =munin add-end= | unix socket     | yes (writes)  |
-| =munin import=                      | unix socket     | yes (writes)  |
-| =munin ping=                        | unix socket     | yes           |
-| =munin list= / =search= / =get=     | direct SQLite   | no            |
-| =munin search -i= (TUI)             | direct SQLite   | no            |
-| =munin init <shell>=                | embedded script | no            |
+| Command                             | Path            | Needs daemon?        |
+|-------------------------------------+-----------------+----------------------|
+| =munin add-start= / =munin add-end= | direct SQLite   | no (capture hot path) |
+| =munin list= / =search= / =get=     | direct SQLite   | no                   |
+| =munin search -i= (TUI)             | direct SQLite   | no                   |
+| =munin init <shell>=                | embedded script | no                   |
+| =munin completions [SHELL]=         | embedded script | no                   |
+| =munin import=                      | unix socket     | yes — auto-starts    |
+| =munin daemon start/stop/status/restart= | unix socket | manages it directly  |
+| =munin daemon ping=                 | unix socket     | no — pure probe      |
 
-WAL mode makes concurrent reads safe alongside the daemon's writes.
+WAL mode makes concurrent reads/writes safe alongside the daemon.
 
 ** Logging
 
 =tracing= to stderr, gated by =MUNIN_LOG= (full =tracing-subscriber= EnvFilter syntax). Default is =info=.
 
 #+begin_src sh
-MUNIN_LOG=debug munind          # foreground, verbose
-journalctl --user -u munind -f  # follow the systemd unit
+MUNIN_LOG=debug munind                  # foreground, verbose
+tail -f ~/.local/state/munin/munind.log # follow an auto-started daemon's log
 #+end_src
 
 * hugin
@@ -255,20 +273,20 @@ just install           # cargo install --path hugin --locked
 #+begin_src sh
 # zsh
 mkdir -p ~/.config/zsh/completions
-just completions-hugin  zsh > ~/.config/zsh/completions/_hugin
+just completions hugin  zsh > ~/.config/zsh/completions/_hugin
 just completions-hugind zsh > ~/.config/zsh/completions/_hugind
 # add `fpath+=(~/.config/zsh/completions)` to ~/.zshrc before `compinit`
 
 # fish
-just completions-hugin  fish > ~/.config/fish/completions/hugin.fish
+just completions hugin  fish > ~/.config/fish/completions/hugin.fish
 just completions-hugind fish > ~/.config/fish/completions/hugind.fish
 
 # bash
-just completions-hugin  bash > ~/.local/share/bash-completion/completions/hugin
+just completions hugin  bash > ~/.local/share/bash-completion/completions/hugin
 just completions-hugind bash > ~/.local/share/bash-completion/completions/hugind
 #+end_src
 
-The binaries also know how to produce their own completions: =hugin completions zsh= and =hugind --generate-completions zsh= are equivalent to the just recipes.
+The binaries produce their own completions directly: =hugin completions zsh= (alias =comp=; SHELL defaults to =$SHELL=) and the daemon's =hugind --generate-completions zsh=. Every CLI in the workspace (hugin, munin, mimir, sleipnir, valkyrie, heimdall) exposes the same =completions [SHELL]= subcommand — =just completions <tool> <shell>= works for all of them.
 
 ** Running under systemd
 
@@ -349,7 +367,7 @@ Reload sway (=$mod+Shift+c=). Click a block to interact:
 | =mimir=               | Run the bar (default).                                                   |
 | =mimir once=          | Print a single plain-text snapshot and exit — handy for debugging.       |
 | =mimir print-config=  | Emit the default =config.toml= (all keys documented).                   |
-| =mimir completions SHELL= | Print a shell-completion script.                                    |
+| =mimir completions [SHELL]= | Print a shell-completion script (alias =comp=; SHELL defaults to =$SHELL=). |
 
 Pass =--config PATH= to override the config location.
 
@@ -407,6 +425,8 @@ eval "$(sleipnir init zsh)"
 
 This adds a =chpwd= hook (records every directory you visit) and binds *Ctrl-T* to the picker.
 
+Shell completions: =sleipnir completions [SHELL]= (alias =comp=; SHELL defaults to =$SHELL=).
+
 ** How it works
 
 - *Directories* are ranked by frecency (frequency × recency, zoxide's decay curve) from the chpwd hook.
@@ -427,6 +447,8 @@ cargo build --release -p valkyrie
 install -Dm755 target/release/valkyrie ~/.local/bin/valkyrie
 eval "$(valkyrie init zsh)"   # in ~/.zshrc: binds Alt-P, adds the `vk` alias
 #+end_src
+
+Shell completions: =valkyrie completions [SHELL]= (alias =comp=; SHELL defaults to =$SHELL=).
 
 ** Keys
 
@@ -463,6 +485,7 @@ install -Dm755 target/release/heimdall ~/.local/bin/heimdall
 heimdall          # the live interactive picker
 heimdall scan     # one-shot, non-interactive dump (IP / MAC / vendor / host / services)
 heimdall init     # print a shell alias (`ht`)
+heimdall completions [SHELL]   # completion script (alias `comp`; SHELL defaults to $SHELL)
 #+end_src
 
 The picker is *presence-first* — it shows who's reachable *right now*. Devices fill in live (names resolve asynchronously via mDNS/SSDP), each shows its last-seen age and *dims when it goes quiet*, dropping after a timeout. Type to fuzzy-filter across IP / MAC / vendor / hostname / service. A horizontal detail strip shows the selected device.
@@ -506,8 +529,7 @@ levelup/
 ├── CLAUDE.md               # codebase notes / invariants
 ├── justfile                # workspace recipes
 ├── dist/
-│   ├── munind.service      # systemd user unit
-│   └── hugind.service
+│   └── hugind.service      # systemd user unit (hugin only; munind is CLI-managed)
 ├── munin/
 │   └── src/
 │       ├── bin/munind.rs   # daemon entry
@@ -515,6 +537,7 @@ levelup/
 │       ├── storage.rs      # SQLite, schema, importers, search
 │       ├── tui.rs          # ratatui picker (direct-SQLite)
 │       ├── ipc.rs          # unix socket, JSON-lines protocol
+│       ├── daemon.rs       # CLI-side lifecycle: race-free auto-start, start/stop/status
 │       ├── proto.rs        # wire types
 │       ├── config.rs       # ~/.config/munin/config.toml
 │       └── shells/         # zsh.sh / bash.sh hook scripts

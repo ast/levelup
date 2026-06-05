@@ -20,6 +20,11 @@ pub fn cache_home() -> Result<PathBuf> {
     base("XDG_CACHE_HOME", ".cache")
 }
 
+/// `$XDG_STATE_HOME`, falling back to `$HOME/.local/state`.
+pub fn state_home() -> Result<PathBuf> {
+    base("XDG_STATE_HOME", ".local/state")
+}
+
 /// `$XDG_RUNTIME_DIR`, falling back to `/tmp` (never fails).
 pub fn runtime_dir() -> PathBuf {
     std::env::var_os("XDG_RUNTIME_DIR")
@@ -48,6 +53,13 @@ pub fn config_file(app: &str) -> Option<PathBuf> {
 /// `<cache_home>/<app>/<file>`. `None` when no base is resolvable.
 pub fn cache_file(app: &str, file: &str) -> Option<PathBuf> {
     cache_home().ok().map(|b| b.join(app).join(file))
+}
+
+/// `<state_home>/<app>/<file>` — e.g. `state_file("munin", "munind.log")`.
+/// State is for logs and other persistent-but-disposable data (XDG: data the
+/// user would not lose sleep over deleting, unlike `data_home`).
+pub fn state_file(app: &str, file: &str) -> Result<PathBuf> {
+    Ok(state_home()?.join(app).join(file))
 }
 
 /// `<runtime_dir>/<name>` — e.g. a unix socket `runtime_file("munin.sock")`.

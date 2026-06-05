@@ -865,6 +865,8 @@ name = "levelup-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "clap",
+ "clap_complete",
  "nucleo-matcher",
  "rusqlite",
  "tracing-subscriber",
@@ -1007,7 +1009,6 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "clap",
- "clap_complete",
  "levelup-core",
  "nix",
  "nom",
@@ -1060,6 +1061,7 @@ dependencies = [
  "crossterm",
  "levelup-core",
  "levelup-tui",
+ "nix",
  "nucleo-matcher",
  "ratatui",
  "rusqlite",

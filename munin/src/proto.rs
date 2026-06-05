@@ -72,6 +72,13 @@ pub enum Request {
     /// `"zsh"` / `"bash"` / `"atuin"`. Long-running; daemon runs it on a
     /// blocking task.
     Import { path: String, source: String },
+    /// Report daemon runtime info (pid, uptime, resolved paths). Backs
+    /// `munin daemon status`; grows sync fields in M6.
+    Status,
+    /// Ask the daemon to shut down gracefully. The daemon replies `Ok`, then
+    /// raises SIGTERM on itself to drive the normal shutdown path. Backs
+    /// `munin daemon stop`.
+    Shutdown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,4 +87,13 @@ pub enum Response {
     Ok,
     Error { message: String },
     Imported { inserted: usize },
+    /// Reply to `Status`. `started_unix_ns` lets the CLI render uptime via
+    /// `fmt_ago`. Sync state will be added here in M6.
+    Status {
+        pid: u32,
+        version: String,
+        started_unix_ns: i64,
+        db_path: String,
+        socket_path: String,
+    },
 }

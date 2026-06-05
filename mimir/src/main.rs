@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
-use clap_complete::Shell;
+use levelup_core::completions::Shell;
 use tracing::debug;
 
 use mimir::blocks::{self, Block, Ctx, Segment};
@@ -36,10 +36,11 @@ enum Cmd {
     Once,
     /// Print the default config TOML to stdout.
     PrintConfig,
-    /// Print a shell-completion script for SHELL.
+    /// Print a shell-completion script to stdout. SHELL defaults to $SHELL.
+    #[command(visible_alias = "comp")]
     Completions {
         #[arg(value_enum)]
-        shell: Shell,
+        shell: Option<Shell>,
     },
 }
 
@@ -54,9 +55,7 @@ fn main() -> Result<()> {
             return Ok(());
         }
         Some(Cmd::Completions { shell }) => {
-            let mut cmd = Cli::command();
-            clap_complete::generate(*shell, &mut cmd, "mimir", &mut std::io::stdout());
-            return Ok(());
+            return levelup_core::completions::print(&mut Cli::command(), "mimir", *shell);
         }
         _ => {}
     }

@@ -31,3 +31,6 @@ ratatui.workspace = true
 crossterm.workspace = true
 toml.workspace = true
 nucleo-matcher.workspace = true
+# signal: raise SIGTERM for graceful Shutdown; fs: Flock for the spawn lock;
+# process: setsid to detach a self-spawned munind.
+nix = { workspace = true, features = ["signal", "fs", "process"] }

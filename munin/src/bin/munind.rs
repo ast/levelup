@@ -7,14 +7,16 @@ use tokio::signal::unix::{SignalKind, signal};
 use tracing::{info, warn};
 
 use munin::cli::DaemonArgs;
+use munin::ipc::DaemonInfo;
 use munin::storage::{Store, StoreCmd, spawn_storage_thread};
-use munin::{init_tracing, ipc};
+use munin::{init_tracing, ipc, now_unix_ns};
 
 fn main() -> Result<()> {
     let args = DaemonArgs::parse();
     init_tracing();
     info!("munin daemon starting");
 
+    let started_unix_ns = now_unix_ns();
     let db_path = args.db_path()?;
     let socket_path = args.socket_path();
 
@@ -33,10 +35,16 @@ fn main() -> Result<()> {
         .build()
         .context("build tokio runtime")?;
 
+    let info = DaemonInfo {
+        started_unix_ns,
+        db_path: db_path.display().to_string(),
+        socket_path: socket_path.display().to_string(),
+    };
+
     runtime.spawn({
         let socket_path = socket_path.clone();
         async move {
-            if let Err(e) = ipc::serve(socket_path, store_tx).await {
+            if let Err(e) = ipc::serve(socket_path, store_tx, info).await {
                 warn!(error = %e, "ipc server stopped");
             }
         }

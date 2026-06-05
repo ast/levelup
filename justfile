@@ -89,11 +89,12 @@ install:
     cargo install --path valkyrie --locked
     cargo install --path heimdall --locked
 
-# Print hugin CLI completions for SHELL (bash, zsh, fish, elvish, powershell)
-completions-hugin SHELL:
-    @cargo run --quiet --bin hugin -p hugin -- completions {{SHELL}}
+# Print a tool's shell completions for SHELL (bash/zsh/fish/elvish/powershell).
+# Works for any CLI: hugin, munin, mimir, sleipnir, valkyrie, heimdall.
+completions TOOL SHELL:
+    @cargo run --quiet --bin {{TOOL}} -p {{TOOL}} -- completions {{SHELL}}
 
-# Print hugind daemon completions for SHELL
+# Print hugind daemon completions for SHELL (the daemon uses a flag, not a subcommand)
 completions-hugind SHELL:
     @cargo run --quiet --bin hugind -p hugin -- --generate-completions {{SHELL}}
 

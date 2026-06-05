@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 use clap::{CommandFactory, Parser, Subcommand};
-use clap_complete::Shell;
+use levelup_core::completions::Shell;
 
 use hugin::proto::{EntryMeta, Request, Response, SearchSort};
 use hugin::tui::{self, Outcome};
@@ -77,11 +77,11 @@ enum Cmd {
         #[arg(long, value_parser = ["regular", "primary"])]
         selection: Option<String>,
     },
-    /// Print a shell-completion script for SHELL to stdout
+    /// Print a shell-completion script to stdout. SHELL defaults to $SHELL.
     #[command(visible_alias = "comp")]
     Completions {
         #[arg(value_enum)]
-        shell: Shell,
+        shell: Option<Shell>,
     },
 }
 
@@ -90,9 +90,7 @@ fn main() -> Result<()> {
 
     // Completions don't talk to the daemon; handle before any socket connect.
     if let Cmd::Completions { shell } = cli.cmd {
-        let mut cmd = Cli::command();
-        clap_complete::generate(shell, &mut cmd, "hugin", &mut std::io::stdout());
-        return Ok(());
+        return levelup_core::completions::print(&mut Cli::command(), "hugin", shell);
     }
 
     let socket_path = cli.socket.clone().unwrap_or_else(default_socket_path);

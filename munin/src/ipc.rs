@@ -32,9 +32,18 @@ use crate::storage::StoreCmd;
 
 pub type StoreTx = mpsc::Sender<StoreCmd>;
 
+/// Static runtime facts about this daemon, surfaced over the `Status` op so
+/// `munin daemon status` can print pid / uptime / resolved paths.
+#[derive(Debug, Clone)]
+pub struct DaemonInfo {
+    pub started_unix_ns: i64,
+    pub db_path: String,
+    pub socket_path: String,
+}
+
 /// Bind to `socket_path` (cleaning a stale file if no live daemon owns it)
 /// and serve connections until the listener errors.
-pub async fn serve(socket_path: PathBuf, store_tx: StoreTx) -> Result<()> {
+pub async fn serve(socket_path: PathBuf, store_tx: StoreTx, info: DaemonInfo) -> Result<()> {
     bind_clean(&socket_path)?;
     let listener = UnixListener::bind(&socket_path)
         .with_context(|| format!("bind {}", socket_path.display()))?;
@@ -45,12 +54,14 @@ pub async fn serve(socket_path: PathBuf, store_tx: StoreTx) -> Result<()> {
     // multiple tokio tasks can grab it without contention beyond the brief
     // moment of the send.
     let store_tx = std::sync::Arc::new(Mutex::new(store_tx));
+    let info = std::sync::Arc::new(info);
 
     loop {
         let (stream, _addr) = listener.accept().await.context("accept")?;
         let store_tx = store_tx.clone();
+        let info = info.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, store_tx).await {
+            if let Err(e) = handle_connection(stream, store_tx, info).await {
                 warn!(error = %e, "ipc connection error");
             }
         });
@@ -83,6 +94,7 @@ fn bind_clean(path: &Path) -> Result<()> {
 async fn handle_connection(
     stream: UnixStream,
     store_tx: std::sync::Arc<Mutex<StoreTx>>,
+    info: std::sync::Arc<DaemonInfo>,
 ) -> Result<()> {
     let (rd, mut wr) = stream.into_split();
     let mut reader = BufReader::new(rd);
@@ -107,17 +119,41 @@ async fn handle_connection(
                 continue;
             }
         };
-        dispatch(req, &store_tx, &mut wr).await?;
+        dispatch(req, &store_tx, &info, &mut wr).await?;
     }
 }
 
 async fn dispatch<W: AsyncWriteExt + Unpin>(
     req: Request,
     store_tx: &Mutex<StoreTx>,
+    info: &DaemonInfo,
     wr: &mut W,
 ) -> Result<()> {
     match req {
         Request::Ping => write_response(wr, &Response::Ok).await,
+        Request::Status => {
+            write_response(
+                wr,
+                &Response::Status {
+                    pid: std::process::id(),
+                    version: crate::VERSION.to_string(),
+                    started_unix_ns: info.started_unix_ns,
+                    db_path: info.db_path.clone(),
+                    socket_path: info.socket_path.clone(),
+                },
+            )
+            .await
+        }
+        Request::Shutdown => {
+            // Reply first so the client sees a clean Ok, then drive the same
+            // graceful path SIGTERM/SIGINT use (wait_for_shutdown_signal in
+            // bin/munind.rs). raise() targets our own process.
+            write_response(wr, &Response::Ok).await?;
+            if let Err(e) = nix::sys::signal::raise(nix::sys::signal::Signal::SIGTERM) {
+                warn!(error = %e, "failed to raise SIGTERM for shutdown");
+            }
+            Ok(())
+        }
         Request::Import { path, source } => {
             let (reply_tx, reply_rx) = oneshot::channel();
             let send_result = {

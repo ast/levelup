@@ -6,15 +6,19 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{Local, NaiveDate, NaiveDateTime, TimeZone};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use levelup_core::completions::Shell as CompletionShell;
 use rusqlite::Connection;
 
 use munin::config;
+use munin::daemon::{self, Stopped};
 use munin::proto::{EntryMeta, Filters, Request, Response, SearchSort};
 use munin::shells::{self, Shell};
 use munin::storage::{self, default_db_path};
 use munin::tui::Outcome;
-use munin::{current_hostname, default_socket_path, fmt_dur, now_unix_ns, sanitize_display, tui};
+use munin::{
+    current_hostname, default_socket_path, fmt_ago, fmt_dur, now_unix_ns, sanitize_display, tui,
+};
 
 #[derive(Parser)]
 #[command(
@@ -41,8 +45,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Verify the daemon is responsive
-    Ping,
     /// Record the start of a shell command (used by shell hooks). Writes
     /// directly to SQLite — works whether or not the daemon is running.
     AddStart {
@@ -101,6 +103,34 @@ enum Cmd {
         #[command(subcommand)]
         from: ImportFrom,
     },
+    /// Manage the background daemon (munind). The daemon also auto-starts on
+    /// demand — these subcommands are for explicit control and inspection.
+    Daemon {
+        #[command(subcommand)]
+        action: DaemonAction,
+    },
+    /// Print a shell-completion script to stdout. SHELL defaults to $SHELL.
+    /// e.g. `munin completions zsh > ~/.zfunc/_munin`.
+    #[command(visible_alias = "comp")]
+    Completions {
+        #[arg(value_enum)]
+        shell: Option<CompletionShell>,
+    },
+}
+
+#[derive(Subcommand)]
+enum DaemonAction {
+    /// Start the daemon if it isn't already running (idempotent).
+    Start,
+    /// Ask the running daemon to shut down gracefully.
+    Stop,
+    /// Show whether the daemon is running, plus pid / uptime / paths.
+    Status,
+    /// Stop the daemon (if running) and start a fresh one.
+    Restart,
+    /// Liveness probe: print "ok" if the daemon answers, else "not running"
+    /// and exit non-zero. Does not start the daemon.
+    Ping,
 }
 
 #[derive(Subcommand)]
@@ -197,25 +227,26 @@ fn main() -> Result<()> {
         Cmd::List { .. } | Cmd::Search { .. } | Cmd::Get { .. } => {
             return run_read(cli.cmd, cli.db.as_deref());
         }
+        Cmd::Daemon { action } => {
+            let path = cli.socket.clone().unwrap_or_else(default_socket_path);
+            return run_daemon(action, &path, cli.db.as_deref());
+        }
+        Cmd::Completions { shell } => {
+            return levelup_core::completions::print(&mut Cli::command(), "munin", shell);
+        }
         // Fall through to the daemon-routed path below.
-        Cmd::Ping | Cmd::Import { .. } => {}
+        Cmd::Import { .. } => {}
     }
 
     let path = cli.socket.unwrap_or_else(default_socket_path);
+    // Daemon-routed subcommands lazily bring the daemon up if it's down.
+    daemon::ensure_running(&path, cli.db.as_deref())?;
     let stream = UnixStream::connect(&path)
         .with_context(|| format!("connect to munin daemon at {}", path.display()))?;
     let mut reader = BufReader::new(stream.try_clone().context("clone socket")?);
     let mut writer = stream;
 
     match cli.cmd {
-        Cmd::Ping => {
-            send(&mut writer, &Request::Ping)?;
-            match read_response(&mut reader)? {
-                Response::Ok => println!("ok"),
-                Response::Error { message } => return Err(anyhow!("{message}")),
-                other => return Err(unexpected("ping", &other)),
-            }
-        }
         Cmd::Import { from } => {
             let (path, source) = match from {
                 ImportFrom::Zsh { path } => (path, "zsh"),
@@ -251,6 +282,67 @@ fn main() -> Result<()> {
         }
         Cmd::List { .. } | Cmd::Search { .. } | Cmd::Get { .. } => {
             unreachable!("read commands return from run_read at the prefix match")
+        }
+        Cmd::Daemon { .. } => unreachable!("daemon returns from run_daemon at the prefix match"),
+        Cmd::Completions { .. } => {
+            unreachable!("completions handled at the prefix match")
+        }
+    }
+    Ok(())
+}
+
+/// Handle `munin daemon {start,stop,status,restart}`. The CLI owns munind's
+/// lifecycle (there is no systemd unit); these are explicit controls on top of
+/// the lazy auto-start that daemon-routed commands trigger.
+fn run_daemon(action: DaemonAction, socket: &Path, db: Option<&Path>) -> Result<()> {
+    match action {
+        DaemonAction::Start => {
+            if daemon::try_connect(socket).is_some() {
+                println!("already running");
+            } else {
+                daemon::ensure_running(socket, db)?;
+                println!("started");
+            }
+        }
+        DaemonAction::Stop => match daemon::stop(socket)? {
+            Stopped::Stopped => println!("stopped"),
+            Stopped::NotRunning => println!("not running"),
+        },
+        DaemonAction::Restart => {
+            match daemon::stop(socket)? {
+                Stopped::Stopped => println!("stopped"),
+                Stopped::NotRunning => {}
+            }
+            daemon::ensure_running(socket, db)?;
+            println!("started");
+        }
+        DaemonAction::Status => match daemon::status(socket)? {
+            None => println!("not running"),
+            Some(Response::Status {
+                pid,
+                version,
+                started_unix_ns,
+                db_path,
+                socket_path,
+            }) => {
+                println!("running");
+                println!("  pid      {pid}");
+                println!("  version  {version}");
+                println!("  uptime   {}", fmt_ago(now_unix_ns(), started_unix_ns));
+                println!("  db       {db_path}");
+                println!("  socket   {socket_path}");
+            }
+            Some(other) => return Err(unexpected("status", &other)),
+        },
+        DaemonAction::Ping => {
+            // Pure probe: never auto-starts. Non-zero exit when down so it's
+            // usable in scripts (`munin daemon ping && …`).
+            if daemon::ping(socket)? {
+                println!("ok");
+            } else {
+                println!("not running");
+                std::process::exit(1);
+            }
         }
     }
     Ok(())

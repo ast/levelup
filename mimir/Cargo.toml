@@ -13,7 +13,6 @@ levelup-core = { path = "../levelup-core" }
 anyhow.workspace = true
 thiserror.workspace = true
 clap.workspace = true
-clap_complete = "4"
 tracing.workspace = true
 tracing-subscriber.workspace = true
 serde.workspace = true

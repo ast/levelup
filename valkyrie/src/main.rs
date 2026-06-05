@@ -19,7 +19,8 @@ mod tui;
 use std::time::Duration;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use levelup_core::completions::Shell as CompletionShell;
 use levelup_core::sanitize_display;
 
 use crate::proc::Scanner;
@@ -55,6 +56,12 @@ enum Cmd {
         #[arg(long, default_value_t = 40)]
         limit: usize,
     },
+    /// Print a shell-completion script to stdout. SHELL defaults to $SHELL.
+    #[command(visible_alias = "comp")]
+    Completions {
+        #[arg(value_enum)]
+        shell: Option<CompletionShell>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -71,6 +78,9 @@ fn main() -> Result<()> {
         Cmd::Pick { query } => {
             tui::run(query.join(" "))?;
             Ok(())
+        }
+        Cmd::Completions { shell } => {
+            levelup_core::completions::print(&mut Cli::command(), "valkyrie", shell)
         }
     }
 }

@@ -6,6 +6,7 @@
 //! This is a *toolkit*, not a framework: each tool composes these functions; we
 //! deliberately don't impose a shared event loop or item model.
 
+pub mod completions;
 pub mod fuzzy;
 pub mod sqlite;
 pub mod xdg;

@@ -21,7 +21,8 @@ mod walk;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use levelup_core::completions::Shell as CompletionShell;
 
 use crate::shells::Shell;
 use crate::storage::{Kind, Row, default_db_path};
@@ -74,6 +75,12 @@ enum Cmd {
     },
     /// Force a refresh of the file pool mined from munin's history.
     Sync,
+    /// Print a shell-completion script to stdout. SHELL defaults to $SHELL.
+    #[command(visible_alias = "comp")]
+    Completions {
+        #[arg(value_enum)]
+        shell: Option<CompletionShell>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -92,6 +99,9 @@ fn main() -> Result<()> {
         Cmd::Sync => {
             levelup_core::init_tracing("SLEIPNIR_LOG");
             run_sync(cli.db.as_deref())
+        }
+        Cmd::Completions { shell } => {
+            levelup_core::completions::print(&mut Cli::command(), "sleipnir", shell)
         }
     }
 }
