@@ -85,8 +85,12 @@ pub enum Request {
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum Response {
     Ok,
-    Error { message: String },
-    Imported { inserted: usize },
+    Error {
+        message: String,
+    },
+    Imported {
+        inserted: usize,
+    },
     /// Reply to `Status`. `started_unix_ns` lets the CLI render uptime via
     /// `fmt_ago`. Sync state will be added here in M6.
     Status {

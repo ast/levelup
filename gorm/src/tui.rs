@@ -14,11 +14,7 @@ use std::fs::File;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
-};
-use crossterm::execute;
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use levelup_core::{fuzzy, sanitize_display};
 use levelup_tui::{editing, terminal};
 use ratatui::Terminal;
@@ -72,37 +68,11 @@ pub fn run() -> Result<()> {
     // Negotiate the Kitty keyboard protocol so held keys report real release
     // events (a steady, jitter-free hold meter). Best-effort: false on terminals
     // that don't support it, where we fall back to the repeat-timeout heuristic.
-    let kbd_enhanced = enable_kbd_enhancement(&mut term);
+    let kbd_enhanced = terminal::enable_keyboard_enhancement(&mut term);
     let result = run_loop(&mut term, engine, &cfg, kbd_enhanced);
-    disable_kbd_enhancement(&mut term, kbd_enhanced);
+    terminal::disable_keyboard_enhancement(&mut term, kbd_enhanced);
     terminal::restore(&mut term).ok();
     result
-}
-
-/// Push the keyboard-enhancement flags if the terminal supports them; returns
-/// whether they were enabled (so the hold logic knows to trust release events).
-/// We need DISAMBIGUATE so modified keys (Alt-U) come through as CSI-u with an
-/// event type, and REPORT_EVENT_TYPES for the press/repeat/release kinds.
-fn enable_kbd_enhancement(term: &mut Terminal<CrosstermBackend<File>>) -> bool {
-    if matches!(
-        crossterm::terminal::supports_keyboard_enhancement(),
-        Ok(true)
-    ) {
-        let flags = KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-            | KeyboardEnhancementFlags::REPORT_EVENT_TYPES;
-        if execute!(term.backend_mut(), PushKeyboardEnhancementFlags(flags)).is_ok() {
-            return true;
-        }
-    }
-    false
-}
-
-/// Pop the flags we pushed (only if we pushed any), so the terminal isn't left
-/// in enhanced mode.
-fn disable_kbd_enhancement(term: &mut Terminal<CrosstermBackend<File>>, enabled: bool) {
-    if enabled {
-        let _ = execute!(term.backend_mut(), PopKeyboardEnhancementFlags);
-    }
 }
 
 fn run_loop(

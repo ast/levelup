@@ -17,7 +17,9 @@ pub use clap_complete::Shell;
 /// is unset or names a shell `clap_complete` can't generate for.
 pub fn print(cmd: &mut clap::Command, bin: &str, shell: Option<Shell>) -> Result<()> {
     let shell = shell.or_else(detect_shell).ok_or_else(|| {
-        anyhow!("could not detect shell from $SHELL; pass one explicitly (e.g. `{bin} completions zsh`)")
+        anyhow!(
+            "could not detect shell from $SHELL; pass one explicitly (e.g. `{bin} completions zsh`)"
+        )
     })?;
     clap_complete::generate(shell, cmd, bin, &mut std::io::stdout());
     Ok(())

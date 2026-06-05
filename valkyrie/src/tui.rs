@@ -49,7 +49,11 @@ const DETAIL_HEIGHT: u16 = 5;
 pub fn run(initial_query: String) -> Result<()> {
     let cfg = config::load_or_default();
     let mut term = terminal::setup()?;
-    let result = run_loop(&mut term, initial_query, &cfg);
+    // Kitty keyboard protocol → real key-release events, so the hold-to-kill
+    // meter is steady (no repeat-timeout flicker). Falls back where unsupported.
+    let kbd_enhanced = terminal::enable_keyboard_enhancement(&mut term);
+    let result = run_loop(&mut term, initial_query, &cfg, kbd_enhanced);
+    terminal::disable_keyboard_enhancement(&mut term, kbd_enhanced);
     terminal::restore(&mut term).ok();
     result
 }
@@ -75,9 +79,12 @@ struct State {
     show_preview: bool,
     my_uid: u32,
     last_scan: Instant,
-    /// `Some(started_at)` while Ctrl-K is held; drives the force-kill meter.
+    /// `Some(started_at)` while Alt-K is held; drives the force-kill meter.
     kill_arm: Option<Instant>,
     kill_last: Instant,
+    /// Latched after a kill fires; blocks re-arming until the key is released,
+    /// so holding past the meter can't SIGKILL a second (now-selected) process.
+    kill_consumed: bool,
     status: Option<(String, Instant)>,
     chooser: Option<Chooser>,
     /// Tree-overview toggle (Ctrl-T). Only takes effect with an empty query.
@@ -93,6 +100,7 @@ fn run_loop(
     term: &mut Terminal<CrosstermBackend<File>>,
     initial_query: String,
     cfg: &Config,
+    kbd_enhanced: bool,
 ) -> Result<()> {
     let cursor = initial_query.len();
     let now = Instant::now();
@@ -110,6 +118,7 @@ fn run_loop(
         last_scan: now,
         kill_arm: None,
         kill_last: now,
+        kill_consumed: false,
         status: None,
         chooser: None,
         tree: false,
@@ -122,26 +131,28 @@ fn run_loop(
     loop {
         term.draw(|f| render(f, &mut state, cfg))?;
 
-        if event::poll(TICK)? {
-            // Accept Repeat too: held keys (the force-kill meter) arrive as
-            // repeats on terminals that report them, plain Press elsewhere.
-            if let Event::Key(key) = event::read()?
-                && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
-                && handle_key(key, &mut state, cfg)
-            {
-                return Ok(());
-            }
+        if event::poll(TICK)?
+            && let Event::Key(key) = event::read()?
+            && handle_key(key, &mut state, cfg, kbd_enhanced)
+        {
+            return Ok(());
         }
 
         let now = Instant::now();
-        // Force-kill meter: fire on a sustained hold, disarm on release.
-        if let Some(start) = state.kill_arm {
-            if now.duration_since(state.kill_last) > KILL_RELEASE_GAP {
-                state.kill_arm = None;
-            } else if now.duration_since(start) >= KILL_HOLD {
-                state.kill_arm = None;
-                state.act(Signal::SIGKILL, cfg);
-            }
+        // Fallback release detection (no Kitty protocol): a gap in key repeats
+        // means the key was let go → disarm and clear the post-fire latch.
+        if !kbd_enhanced && now.duration_since(state.kill_last) > KILL_RELEASE_GAP {
+            state.kill_arm = None;
+            state.kill_consumed = false;
+        }
+        // Force-kill meter: fire on a sustained hold; latch so holding on can't
+        // SIGKILL a second process.
+        if let Some(start) = state.kill_arm
+            && now.duration_since(start) >= KILL_HOLD
+        {
+            state.kill_arm = None;
+            state.kill_consumed = true;
+            state.act(Signal::SIGKILL, cfg);
         }
         // Live rescan.
         if now.duration_since(state.last_scan) >= RESCAN_EVERY {
@@ -295,7 +306,16 @@ impl State {
 }
 
 /// Returns `true` to quit.
-fn handle_key(key: KeyEvent, state: &mut State, cfg: &Config) -> bool {
+fn handle_key(key: KeyEvent, state: &mut State, cfg: &Config, kbd_enhanced: bool) -> bool {
+    // Key-release ends the force-kill hold immediately (the Kitty protocol's
+    // key-up). Match the bare key code since Alt may be lifted before K.
+    if key.kind == KeyEventKind::Release {
+        if matches!(key.code, KeyCode::Char('k')) {
+            state.kill_arm = None;
+            state.kill_consumed = false;
+        }
+        return false;
+    }
     if state.chooser.is_some() {
         return handle_chooser_key(key, state, cfg);
     }
@@ -309,14 +329,20 @@ fn handle_key(key: KeyEvent, state: &mut State, cfg: &Config) -> bool {
 
         // ---- actions ----------------------------------------------------
         KeyCode::Enter => state.act(Signal::SIGTERM, cfg),
-        // Hold Alt-K (M-k) → force-kill meter. Each press (incl. auto-repeat)
-        // keeps it armed; the loop fires once it's been held long enough.
+        // Hold Alt-K (M-k) → force-kill meter. Arms on press; the loop fires
+        // once it's been held long enough. `kill_consumed` blocks re-arm after a
+        // fire until release. With the Kitty protocol, a real key-up disarms;
+        // otherwise auto-repeats re-confirm the hold and the timeout does release.
         // (Ctrl-K stays Emacs kill-to-end-of-line in the query — never a process
         // action, so an editing reflex can't trigger a kill.)
         KeyCode::Char('k') if alt => {
             let now = Instant::now();
-            if state.kill_arm.is_none() || now.duration_since(state.kill_last) > KILL_RELEASE_GAP {
-                state.kill_arm = Some(now);
+            if !state.kill_consumed {
+                let rearm = state.kill_arm.is_none()
+                    || (!kbd_enhanced && now.duration_since(state.kill_last) > KILL_RELEASE_GAP);
+                if rearm {
+                    state.kill_arm = Some(now);
+                }
             }
             state.kill_last = now;
         }

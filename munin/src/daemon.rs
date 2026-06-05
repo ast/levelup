@@ -91,9 +91,7 @@ fn spawn_detached(socket: &Path, db: Option<&Path>) -> Result<()> {
         .stderr(Stdio::from(err));
     // SAFETY: setsid is async-signal-safe and we touch no other shared state.
     unsafe {
-        cmd.pre_exec(|| {
-            nix::unistd::setsid().map(|_| ()).map_err(Into::into)
-        });
+        cmd.pre_exec(|| nix::unistd::setsid().map(|_| ()).map_err(Into::into));
     }
     let child = cmd
         .spawn()
@@ -174,7 +172,9 @@ pub fn stop(socket: &Path) -> Result<Stopped> {
     let deadline = Instant::now() + SPAWN_TIMEOUT;
     while try_connect(socket).is_some() {
         if Instant::now() >= deadline {
-            return Err(anyhow!("munind acknowledged shutdown but is still listening"));
+            return Err(anyhow!(
+                "munind acknowledged shutdown but is still listening"
+            ));
         }
         std::thread::sleep(POLL_INTERVAL);
     }
