@@ -146,8 +146,12 @@ impl State {
                 verb,
                 error,
             } => {
-                // An action resolving (esp. pairing) ends any pending prompt.
-                self.clear_prompt();
+                // If this resolves the device we're prompting to pair (e.g. it
+                // failed/timed out without an answer), dismiss the now-dead
+                // prompt — but leave an unrelated device's prompt alone.
+                if self.prompt.as_ref().is_some_and(|p| p.address == address) {
+                    self.clear_prompt();
+                }
                 let name = self
                     .results
                     .iter()

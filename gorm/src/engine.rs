@@ -1,6 +1,6 @@
 //! The BlueZ engine: a background thread owning a tokio runtime + `bluer`
 //! session. It polls the adapter on a tick and streams `Fact`s to the TUI, and
-//! takes `Cmd`s back (toggling discovery). This is the bidirectional shape
+//! takes `Cmd`s back (connect, pair, trust, …). This is the bidirectional shape
 //! heimdall's one-way discovery engine doesn't need.
 //!
 //! Why polling rather than pure event subscription: BlueZ device counts are

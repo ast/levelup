@@ -1,7 +1,7 @@
 //! The device model + the engine↔TUI channel types.
 
-/// A Bluetooth device as gorm sees it — a snapshot merged from BlueZ
-/// properties (and the cache, for devices BlueZ has since forgotten).
+/// A Bluetooth device as gorm sees it — a snapshot of BlueZ's properties for
+/// one device.
 #[derive(Debug, Clone)]
 pub struct BtDevice {
     /// The device's Bluetooth address (MAC), the stable identity.

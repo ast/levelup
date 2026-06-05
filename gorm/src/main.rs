@@ -2,7 +2,7 @@
 //! Old, Harald Bluetooth's father — the namesake lineage of Bluetooth itself.
 //! Heimdall watches the LAN; gorm tends the personal Bluetooth radius.
 //!
-//! Run `gorm` for the live picker (M1), `gorm scan` for a one-shot dump.
+//! Run `gorm` for the live picker, `gorm scan` for a one-shot dump.
 
 mod config;
 mod device;
