@@ -57,6 +57,8 @@ struct State {
     ports_rx: Receiver<(Ipv4Addr, Vec<u16>)>,
     /// Transient action feedback (message + when set).
     status: Option<(String, Instant)>,
+    /// Detail strip visible? Toggled with Ctrl-V; seeded from `cfg.preview`.
+    show_detail: bool,
     /// MAC-keyed speed cache (None if it couldn't be opened).
     cache: Option<Connection>,
     last_flush: Instant,
@@ -104,6 +106,7 @@ fn run_loop(
         ports_tx,
         ports_rx,
         status: None,
+        show_detail: cfg.preview,
         cache,
         last_flush: now,
     };
@@ -325,6 +328,8 @@ fn handle_key(key: KeyEvent, state: &mut State) -> Step {
                 state.set_status(format!("scanning ports on {ip}…"));
             }
         }
+        // Ctrl-V → show/hide the detail strip.
+        KeyCode::Char('v') if ctrl => state.show_detail = !state.show_detail,
 
         // ---- list navigation -------------------------------------------
         KeyCode::Up => state.move_selection(-1),
@@ -378,7 +383,7 @@ fn delete_word(state: &mut State) {
 
 fn render(f: &mut ratatui::Frame<'_>, state: &mut State, cfg: &Config) {
     let area = f.area();
-    let detail_h = if cfg.preview { 4 } else { 0 };
+    let detail_h = if state.show_detail { 4 } else { 0 };
     // Bottom-anchored like the sibling tools: list on top, then the detail
     // strip, with the status/toolbar and search prompt pinned to the bottom.
     let chunks = LayoutWidget::default()
@@ -426,7 +431,7 @@ fn render_status(f: &mut ratatui::Frame<'_>, state: &State, cfg: &Config, area: 
         )),
         _ => Line::from(Span::styled(
             format!(
-                " {n} online · {cidrs} · Enter open · ^S ssh · ^Y copy · Tab port-scan · Esc",
+                " {n} online · {cidrs} · Enter open · ^S ssh · ^Y copy · Tab port-scan · ^V detail · Esc",
                 n = state.results.len(),
                 cidrs = state.cidrs,
             ),
