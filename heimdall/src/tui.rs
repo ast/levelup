@@ -401,6 +401,43 @@ fn render(f: &mut ratatui::Frame<'_>, state: &mut State, cfg: &Config) {
     }
     render_status(f, state, cfg, chunks[2]);
     render_prompt(f, state, cfg, chunks[3]);
+    // Scroll cues last, so they overlay the list's header / divider edges.
+    // The detail strip's top border (when shown) is the natural bottom edge.
+    let divider_y = (detail_h > 0).then_some(chunks[1].y);
+    render_scroll_cues(f, state, cfg, chunks[0], divider_y);
+}
+
+/// Unobtrusive "there's more" cues: a dim `▲ N` at the list header's right edge
+/// when rows are hidden above, and `▼ N` at the bottom edge (the detail divider,
+/// or the list's last row) when hidden below. Present only when clipped — no
+/// persistent scrollbar (the Raskin objection).
+fn render_scroll_cues(
+    f: &mut ratatui::Frame<'_>,
+    state: &State,
+    cfg: &Config,
+    list: Rect,
+    divider_y: Option<u16>,
+) {
+    let dim = Style::default().fg(cfg.colors.status_fg.to_ratatui());
+    let total = state.results.len();
+    let offset = state.table_state.offset();
+    // The table reserves one row for the header; the rest holds data rows.
+    let body = list.height.saturating_sub(1) as usize;
+
+    let put = |f: &mut ratatui::Frame<'_>, y: u16, s: String| {
+        let w = s.chars().count() as u16;
+        let x = list.x + list.width.saturating_sub(w);
+        f.buffer_mut().set_string(x, y, s, dim);
+    };
+
+    if offset > 0 {
+        put(f, list.y, format!("▲ {offset} "));
+    }
+    let below = total.saturating_sub(offset + body);
+    if below > 0 {
+        let y = divider_y.unwrap_or_else(|| list.y + list.height.saturating_sub(1));
+        put(f, y, format!(" ▼ {below} "));
+    }
 }
 
 fn render_prompt(f: &mut ratatui::Frame<'_>, state: &State, cfg: &Config, area: Rect) {
@@ -577,44 +614,45 @@ fn render_detail(f: &mut ratatui::Frame<'_>, state: &State, cfg: &Config, area: 
     };
     let d = &r.device;
     let age = Instant::now().duration_since(r.last_seen).as_secs();
-    let ports = if d.open_ports.is_empty() {
-        "—".to_string()
-    } else {
-        d.open_ports
-            .iter()
-            .map(|p| format!(":{p}"))
-            .collect::<Vec<_>>()
-            .join(" ")
-    };
-    let services = if d.services.is_empty() {
-        "—".to_string()
-    } else {
-        d.services.join(", ")
-    };
-    let pair = |k: &str, v: String| -> Vec<Span<'static>> {
-        vec![
-            Span::styled(format!("{k} "), dim),
-            Span::raw(sanitize_display(&v)),
-        ]
-    };
-    let mut l1 = pair("ip", d.ip.to_string());
-    l1.push(Span::styled("   mac ", dim));
-    l1.push(Span::raw(d.mac.clone().unwrap_or_else(|| "—".into())));
-    l1.push(Span::styled("   vendor ", dim));
-    l1.push(Span::raw(sanitize_display(
-        d.vendor.as_deref().unwrap_or("?"),
-    )));
-    let mut l2 = pair("host", d.hostname.clone().unwrap_or_else(|| "—".into()));
-    l2.push(Span::styled("   services ", dim));
-    l2.push(Span::raw(sanitize_display(&services)));
-    let mut l3 = pair("ports", ports);
-    l3.push(Span::styled("   seen ", dim));
-    l3.push(Span::raw(format!("{age}s ago")));
+    let ports = d
+        .open_ports
+        .iter()
+        .map(|p| format!(":{p}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let services = d.services.join(" ");
 
-    f.render_widget(
-        Paragraph::new(vec![Line::from(l1), Line::from(l2), Line::from(l3)]),
-        inner,
-    );
+    // Two fixed columns of aligned `label value` pairs, so every field sits in
+    // the same spot regardless of device; an unknown value is just left blank
+    // (no placeholder glyph). `lw` pads the label so values line up.
+    let row = |label: &str, lw: usize, value: &str| -> Line<'static> {
+        Line::from(vec![
+            Span::styled(format!("{label:<lw$} "), dim),
+            Span::raw(sanitize_display(value)),
+        ])
+    };
+    let cols = LayoutWidget::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(inner);
+
+    let left = Paragraph::new(vec![
+        row("ip", 6, &d.ip.to_string()),
+        row("mac", 6, d.mac.as_deref().unwrap_or("")),
+        row("vendor", 6, d.vendor.as_deref().unwrap_or("")),
+    ]);
+    let right = Paragraph::new(vec![
+        row("host", 8, d.hostname.as_deref().unwrap_or("")),
+        row("services", 8, &services),
+        Line::from(vec![
+            Span::styled(format!("{:<8} ", "ports"), dim),
+            Span::raw(sanitize_display(&ports)),
+            Span::styled("   seen ", dim),
+            Span::raw(format!("{age}s ago")),
+        ]),
+    ]);
+    f.render_widget(left, cols[0]);
+    f.render_widget(right, cols[1]);
 }
 
 /// Upsert all currently-known devices (those with a MAC) into the cache.
