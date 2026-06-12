@@ -782,6 +782,13 @@ fn render_detail(f: &mut ratatui::Frame<'_>, state: &State, cfg: &Config, area: 
             .map(|b| format!("{b}%"))
             .unwrap_or_else(|| "—".into()),
     ));
+    l3.push(Span::styled("   does ", dim));
+    let summary = d.profile_summary();
+    l3.push(Span::raw(if summary.is_empty() {
+        "—".into()
+    } else {
+        summary
+    }));
 
     f.render_widget(
         Paragraph::new(vec![Line::from(l1), Line::from(l2), Line::from(l3)]),

@@ -25,6 +25,66 @@ pub struct BtDevice {
     pub vendor: Option<String>,
     /// Battery level 0–100 when the device exposes it.
     pub battery: Option<u8>,
+    /// Recognized capabilities derived from the device's advertised service
+    /// UUIDs — what it *can* do (audio out, mic, …), not what's live right now.
+    /// Sorted, deduped; empty when the device advertises nothing we recognise.
+    pub profiles: Vec<Profile>,
+}
+
+/// A user-facing capability inferred from a Bluetooth device's advertised
+/// service-class UUIDs (the SDP profiles it supports). This is *capability*,
+/// not live routing — it says a headset can play audio and carry a mic, not
+/// that audio is flowing right now (that lives in BlueZ's MediaTransport1,
+/// owned by PipeWire on this desktop). Declaration order is the display order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Profile {
+    /// A2DP Audio Sink — the device receives our audio (headphones, speaker).
+    AudioOut,
+    /// A2DP Audio Source — the device streams audio to us (e.g. a phone).
+    AudioIn,
+    /// HFP / HSP — headset voice with a microphone.
+    Mic,
+    /// AVRCP — play / pause / skip transport controls.
+    MediaKeys,
+    /// HID — keyboard, mouse, gamepad.
+    Input,
+}
+
+impl Profile {
+    /// A short, human label for the detail strip / `scan` dump.
+    pub fn label(self) -> &'static str {
+        match self {
+            Profile::AudioOut => "Audio out",
+            Profile::AudioIn => "Audio in",
+            Profile::Mic => "Mic",
+            Profile::MediaKeys => "Media keys",
+            Profile::Input => "Input",
+        }
+    }
+
+    /// Map a device's advertised 16-bit service-class UUIDs to the capabilities
+    /// we surface. Unknown UUIDs are ignored; the result is sorted and deduped.
+    pub fn from_uuids(short_uuids: &[u16]) -> Vec<Profile> {
+        let mut out = Vec::new();
+        let mut add = |p: Profile| {
+            if !out.contains(&p) {
+                out.push(p);
+            }
+        };
+        for &id in short_uuids {
+            match id {
+                0x110B => add(Profile::AudioOut),     // AudioSink
+                0x110A => add(Profile::AudioIn),      // AudioSource
+                0x111E | 0x1108 => add(Profile::Mic), // Handsfree (HFP), Headset (HSP)
+                // AVRCP: Remote Control / Target / Controller.
+                0x110E | 0x110C | 0x110F => add(Profile::MediaKeys),
+                0x1124 => add(Profile::Input), // Human Interface Device
+                _ => {}
+            }
+        }
+        out.sort_unstable();
+        out
+    }
 }
 
 impl BtDevice {
@@ -39,6 +99,16 @@ impl BtDevice {
         } else {
             "-"
         }
+    }
+
+    /// Capabilities joined for display, e.g. `Audio out · Mic`. Empty string
+    /// when nothing recognisable is advertised.
+    pub fn profile_summary(&self) -> String {
+        self.profiles
+            .iter()
+            .map(|p| p.label())
+            .collect::<Vec<_>>()
+            .join(" · ")
     }
 
     /// The string nucleo matches against in the picker — name, address, device
@@ -56,6 +126,10 @@ impl BtDevice {
         {
             s.push(' ');
             s.push_str(part);
+        }
+        for p in &self.profiles {
+            s.push(' ');
+            s.push_str(p.label());
         }
         s
     }

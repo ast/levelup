@@ -70,16 +70,17 @@ fn run_scan() -> Result<()> {
     let devices = rt.block_on(engine::scan_once())?;
 
     println!(
-        "{:<17} {:<12} {:>5} {:>5} {:<16} {:<18} NAME",
-        "ADDRESS", "STATE", "RSSI", "BATT", "TYPE", "VENDOR"
+        "{:<17} {:<12} {:>5} {:>5} {:<16} {:<18} {:<22} NAME",
+        "ADDRESS", "STATE", "RSSI", "BATT", "TYPE", "VENDOR", "PROFILES"
     );
     for d in &devices {
         let mut state = d.state_label().to_string();
         if d.trusted {
             state.push_str(" ✓");
         }
+        let profiles = d.profile_summary();
         println!(
-            "{:<17} {:<12} {:>5} {:>5} {:<16} {:<18} {}",
+            "{:<17} {:<12} {:>5} {:>5} {:<16} {:<18} {:<22} {}",
             d.address,
             state,
             d.rssi.map(|r| r.to_string()).unwrap_or_else(|| "-".into()),
@@ -88,6 +89,7 @@ fn run_scan() -> Result<()> {
                 .unwrap_or_else(|| "-".into()),
             d.icon.as_deref().unwrap_or("-"),
             d.vendor.as_deref().unwrap_or("-"),
+            if profiles.is_empty() { "-" } else { &profiles },
             d.name.as_deref().unwrap_or("(unknown)"),
         );
     }

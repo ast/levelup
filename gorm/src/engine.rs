@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use bluer::UuidExt;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::warn;
@@ -354,6 +355,18 @@ pub async fn read_all(adapter: &bluer::Adapter, vendors: Option<&Vendors>) -> Ve
             _ => dev.name().await.ok().flatten(),
         };
         let vendor = vendors.and_then(|v| v.lookup(&addr_str));
+        // Advertised service-class UUIDs → the capabilities we surface. BlueZ
+        // hands back full 128-bit UUIDs; keep the ones in the Bluetooth base
+        // range as their 16-bit short form and let `Profile` map the known ones.
+        let short_uuids: Vec<u16> = dev
+            .uuids()
+            .await
+            .ok()
+            .flatten()
+            .into_iter()
+            .flatten()
+            .filter_map(|u| u.as_u16())
+            .collect();
         devices.push(BtDevice {
             address: addr_str,
             name,
@@ -365,6 +378,7 @@ pub async fn read_all(adapter: &bluer::Adapter, vendors: Option<&Vendors>) -> Ve
             icon: dev.icon().await.ok().flatten(),
             vendor,
             battery: dev.battery_percentage().await.ok().flatten(),
+            profiles: crate::device::Profile::from_uuids(&short_uuids),
         });
     }
     devices

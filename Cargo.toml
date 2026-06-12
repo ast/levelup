@@ -10,6 +10,7 @@ members = [
     "valkyrie",
     "heimdall",
     "gorm",
+    "bragi",
 ]
 
 [workspace.package]
@@ -49,6 +50,10 @@ mdns-sd = "0.11"
 # Bluetooth device management (gorm): typed BlueZ binding over D-Bus. Links
 # libdbus via the `dbus` crate, so building needs `libdbus-1-dev` + pkg-config.
 bluer = { version = "0.17", features = ["bluetoothd"] }
+# Audio routing (bragi): official Rust bindings to libpipewire. Building needs
+# `libpipewire-0.3-dev` + libclang (bindgen).
+pipewire = "0.10"
+libspa = "0.10"
 
 [profile.release]
 lto = "thin"
