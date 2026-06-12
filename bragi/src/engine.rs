@@ -34,7 +34,7 @@ use pw::registry::{GlobalObject, RegistryRc};
 use pw::types::ObjectType;
 use tracing::{debug, info, warn};
 
-use crate::state::{AudioNode, AudioState, NodeKind};
+use crate::state::{AudioDevice, AudioNode, AudioState, NodeKind, Profile};
 
 /// Commands the TUI sends into the PipeWire loop.
 #[derive(Debug, Clone)]
@@ -58,6 +58,11 @@ pub enum Cmd {
     },
     ToggleMute {
         node: u32,
+    },
+    /// Switch a device to another profile (A2DP ↔ headset, HDMI ↔ analog).
+    SetProfile {
+        device: u32,
+        index: i32,
     },
 }
 
@@ -190,7 +195,7 @@ fn run(tx: Sender<AudioState>, cmd_rx: pw::channel::Receiver<Cmd>) -> Result<()>
             move |obj| match obj.type_ {
                 ObjectType::Node => on_node(&graph, &nodes_px, &listeners, &registry, &core, obj),
                 ObjectType::Link => on_link(&graph, obj),
-                ObjectType::Device => on_device(&devices, &listeners, &registry, obj),
+                ObjectType::Device => on_device(&graph, &devices, &listeners, &registry, obj),
                 ObjectType::Metadata => {
                     on_metadata(&graph, &default_meta, &listeners, &registry, obj)
                 }
@@ -219,6 +224,9 @@ fn run(tx: Sender<AudioState>, cmd_rx: pw::channel::Receiver<Cmd>) -> Result<()>
                     g.publish();
                 } else if g.state.links.remove(&id).is_some() {
                     debug!("- link id={id}");
+                    g.publish();
+                } else if let Some(d) = g.state.devices.remove(&id) {
+                    debug!("- device id={id} {}", d.name);
                     g.publish();
                 }
             }
@@ -295,6 +303,26 @@ fn handle_cmd(
                 .unwrap_or_else(|| t.node_name.clone());
             info!("cmd: move {} → {}", s.name, t.name);
             md.set_property(stream, "target.object", Some("Spa:Id"), Some(&value));
+        }
+        Cmd::SetProfile { device, index } => {
+            let devs = devices.borrow();
+            let Some(entry) = devs.get(&device) else {
+                return;
+            };
+            info!("cmd: profile device={device} → {index}");
+            let value = Value::Object(Object {
+                type_: libspa::sys::SPA_TYPE_OBJECT_ParamProfile,
+                id: libspa::sys::SPA_PARAM_Profile,
+                properties: vec![
+                    Property::new(libspa::sys::SPA_PARAM_PROFILE_index, Value::Int(index)),
+                    // Persist in WirePlumber's state, like wpctl does.
+                    Property::new(libspa::sys::SPA_PARAM_PROFILE_save, Value::Bool(true)),
+                ],
+            });
+            set_param(
+                |pod| entry.proxy.set_param(ParamType::Profile, 0, pod),
+                &value,
+            );
         }
         Cmd::SetDefault { device } => {
             let meta = default_meta.borrow();
@@ -538,9 +566,11 @@ fn on_node(
     }
 }
 
-/// A new audio `Device` (ALSA card / bluez endpoint): bind it and follow its
-/// active `Route` params so volume/mute commands know which route to write.
+/// A new audio `Device` (ALSA card / bluez endpoint): bind it, follow its
+/// active `Route` params (so volume/mute commands know which route to write)
+/// and its `EnumProfile`/`Profile` params (what the Alt-P chooser offers).
 fn on_device(
+    graph: &SharedGraph,
     devices: &Devices,
     listeners: &Listeners,
     registry: &RegistryRc,
@@ -557,29 +587,94 @@ fn on_device(
             return;
         }
     };
-    debug!(
-        "+ device id={} {}",
-        obj.id,
-        props.get("device.description").unwrap_or("(unnamed)")
-    );
+    let name = props
+        .get("device.description")
+        .unwrap_or("(unnamed)")
+        .to_string();
+    debug!("+ device id={} {name}", obj.id);
+    {
+        let mut g = graph.borrow_mut();
+        g.state.devices.insert(
+            obj.id,
+            AudioDevice {
+                name,
+                ..AudioDevice::default()
+            },
+        );
+        g.publish();
+    }
 
-    device.subscribe_params(&[ParamType::Route]);
+    device.subscribe_params(&[ParamType::Route, ParamType::Profile, ParamType::EnumProfile]);
     let listener = device
         .add_listener_local()
+        // Device param *changes* are not pushed to subscribers (unlike node
+        // `Props` — observed on PipeWire 1.0.5: the subscription delivers the
+        // initial values and then goes quiet, even for wpctl-driven profile
+        // switches). So do what pw-mon does: on every info event whose change
+        // mask flags params, re-enumerate — the results arrive through the
+        // same `param` callback below.
+        .info({
+            let devices = devices.clone();
+            let id = obj.id;
+            move |info| {
+                if !info
+                    .change_mask()
+                    .contains(pw::device::DeviceChangeMask::PARAMS)
+                {
+                    return;
+                }
+                if let Some(entry) = devices.borrow().get(&id) {
+                    for ty in [ParamType::EnumProfile, ParamType::Profile, ParamType::Route] {
+                        entry.proxy.enum_params(0, Some(ty), 0, u32::MAX);
+                    }
+                }
+            }
+        })
         .param({
+            let graph = graph.clone();
             let devices = devices.clone();
             let id = obj.id;
             move |_seq, ty, _index, _next, param| {
-                if ty != ParamType::Route {
-                    return;
-                }
                 let Some(pod) = param else { return };
-                let Some((route_index, route_device)) = parse_route(pod) else {
-                    return;
-                };
-                debug!("route device={id} card-dev={route_device} index={route_index}");
-                if let Some(entry) = devices.borrow_mut().get_mut(&id) {
-                    entry.routes.insert(route_device, route_index);
+                match ty {
+                    ParamType::Route => {
+                        let Some((route_index, route_device)) = parse_route(pod) else {
+                            return;
+                        };
+                        debug!("route device={id} card-dev={route_device} index={route_index}");
+                        if let Some(entry) = devices.borrow_mut().get_mut(&id) {
+                            entry.routes.insert(route_device, route_index);
+                        }
+                    }
+                    // One event per offered profile.
+                    ParamType::EnumProfile => {
+                        let Some(profile) = parse_profile(pod) else {
+                            return;
+                        };
+                        let mut g = graph.borrow_mut();
+                        let Some(d) = g.state.devices.get_mut(&id) else {
+                            return;
+                        };
+                        d.profiles.insert(profile.index, profile);
+                        g.publish();
+                    }
+                    // The active profile.
+                    ParamType::Profile => {
+                        let Some(profile) = parse_profile(pod) else {
+                            return;
+                        };
+                        info!(
+                            "profile device={id} active → {} ({})",
+                            profile.index, profile.description
+                        );
+                        let mut g = graph.borrow_mut();
+                        let Some(d) = g.state.devices.get_mut(&id) else {
+                            return;
+                        };
+                        d.active_profile = Some(profile.index);
+                        g.publish();
+                    }
+                    _ => {}
                 }
             }
         })
@@ -681,6 +776,42 @@ fn display_name(kind: NodeKind, props: &DictRef) -> String {
 fn default_node_name(value: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(value).ok()?;
     Some(v.get("name")?.as_str()?.to_string())
+}
+
+/// Pull a [`Profile`] out of an `EnumProfile`/`Profile` param object.
+fn parse_profile(pod: &Pod) -> Option<Profile> {
+    let Ok((_, Value::Object(object))) = PodDeserializer::deserialize_any_from(pod.as_bytes())
+    else {
+        return None;
+    };
+    let mut index = None;
+    let mut description = None;
+    let mut available = true;
+    for prop in object.properties {
+        match prop.key {
+            libspa::sys::SPA_PARAM_PROFILE_index => {
+                if let Value::Int(i) = prop.value {
+                    index = Some(i);
+                }
+            }
+            libspa::sys::SPA_PARAM_PROFILE_description => {
+                if let Value::String(s) = prop.value {
+                    description = Some(s);
+                }
+            }
+            libspa::sys::SPA_PARAM_PROFILE_available => {
+                if let Value::Id(id) = prop.value {
+                    available = id.0 != libspa::sys::SPA_PARAM_AVAILABILITY_no;
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(Profile {
+        index: index?,
+        description: description.unwrap_or_default(),
+        available,
+    })
 }
 
 /// Pull `(index, device)` out of an active `Route` param — the coordinates a

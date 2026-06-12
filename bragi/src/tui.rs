@@ -50,18 +50,25 @@ struct State {
     results: Vec<AudioNode>,
     table_state: TableState,
     status: Option<(String, Instant)>,
-    /// An open device chooser ("move this stream to…"); replaces the list
-    /// until answered or dismissed.
+    /// An open chooser ("move this stream to…" / "switch profile to…");
+    /// replaces the list until answered or dismissed.
     chooser: Option<Chooser>,
 }
 
-/// The move-stream device chooser.
+/// A modal chooser: pick one option, dispatch the action it stands for.
 struct Chooser {
-    stream: u32,
-    stream_name: String,
-    /// Candidate devices: (node id, display label).
+    /// Natural-language prefix ("move Firefox to") for the status line and
+    /// the confirmation message.
+    title: String,
+    action: ChooserAction,
+    /// (value, label) — a node id for moves, a profile index for profiles.
     options: Vec<(u32, String)>,
     sel: usize,
+}
+
+enum ChooserAction {
+    Move { stream: u32 },
+    Profile { device: u32 },
 }
 
 pub fn run() -> Result<()> {
@@ -134,7 +141,7 @@ impl State {
     }
 
     /// Enter on a stream: open the chooser over devices it could move to.
-    fn open_chooser(&mut self, stream: &AudioNode) {
+    fn open_move_chooser(&mut self, stream: &AudioNode) {
         let wanted = match stream.kind {
             NodeKind::Playback => NodeKind::Sink,
             NodeKind::Record => NodeKind::Source,
@@ -163,8 +170,51 @@ impl State {
             .position(|&(id, _)| Some(id) == current)
             .unwrap_or(0);
         self.chooser = Some(Chooser {
-            stream: stream.id,
-            stream_name: stream.name.clone(),
+            title: format!("move {} to", stream.name),
+            action: ChooserAction::Move { stream: stream.id },
+            options,
+            sel,
+        });
+    }
+
+    /// Alt-P on a device row: open the chooser over its card's profiles.
+    fn open_profile_chooser(&mut self, node: &AudioNode) {
+        let info = self.audio.device_of(node).map(|(id, d)| {
+            (
+                id,
+                d.name.clone(),
+                d.active_profile,
+                d.profiles.values().cloned().collect::<Vec<_>>(),
+            )
+        });
+        let Some((device, name, active, profiles)) = info else {
+            self.set_status("no profiles for this device".into());
+            return;
+        };
+        let options: Vec<(u32, String)> = profiles
+            .iter()
+            .map(|p| {
+                let mut label = p.description.clone();
+                if Some(p.index) == active {
+                    label.push_str("  (active)");
+                }
+                if !p.available {
+                    label.push_str("  (unavailable)");
+                }
+                (p.index as u32, label)
+            })
+            .collect();
+        if options.is_empty() {
+            self.set_status("no profiles for this device".into());
+            return;
+        }
+        let sel = profiles
+            .iter()
+            .position(|p| Some(p.index) == active)
+            .unwrap_or(0);
+        self.chooser = Some(Chooser {
+            title: format!("switch {name} to"),
+            action: ChooserAction::Profile { device },
             options,
             sel,
         });
@@ -277,8 +327,14 @@ fn handle_key(key: KeyEvent, state: &mut State) -> bool {
                     state.set_status(format!("default {} → {}", n.kind.label(), n.name));
                     state.dispatch(Cmd::SetDefault { device: n.id });
                 } else {
-                    state.open_chooser(&n);
+                    state.open_move_chooser(&n);
                 }
+            }
+        }
+        // Alt-P → profile chooser for the device under the cursor.
+        KeyCode::Char('p') if alt => {
+            if let Some(n) = state.selected().filter(|n| n.kind.is_device()).cloned() {
+                state.open_profile_chooser(&n);
             }
         }
         // Alt-D → explicit set-default (devices only).
@@ -376,12 +432,25 @@ fn handle_chooser_key(key: KeyEvent, state: &mut State, ctrl: bool) -> bool {
             chooser.sel = (chooser.sel + 1).min(chooser.options.len() - 1)
         }
         KeyCode::Enter => {
-            let (target, label) = chooser.options[chooser.sel].clone();
-            let stream = chooser.stream;
-            let name = chooser.stream_name.clone();
-            state.chooser = None;
-            state.set_status(format!("moving {name} → {label}"));
-            state.dispatch(Cmd::Move { stream, target });
+            let Some(ch) = state.chooser.take() else {
+                return false;
+            };
+            let (value, label) = ch.options[ch.sel].clone();
+            state.set_status(format!("{} {label}", ch.title));
+            match ch.action {
+                ChooserAction::Move { stream } => {
+                    state.dispatch(Cmd::Move {
+                        stream,
+                        target: value,
+                    });
+                }
+                ChooserAction::Profile { device } => {
+                    state.dispatch(Cmd::SetProfile {
+                        device,
+                        index: value as i32,
+                    });
+                }
+            }
         }
         _ => {}
     }
@@ -471,8 +540,8 @@ fn render_status(f: &mut ratatui::Frame<'_>, state: &State, cfg: &Config, area: 
     } else if let Some(chooser) = &state.chooser {
         Line::from(Span::styled(
             format!(
-                " move {} to…  ·  Enter move · Esc back",
-                sanitize_display(&chooser.stream_name)
+                " {}…  ·  Enter confirm · Esc back",
+                sanitize_display(&chooser.title)
             ),
             dim,
         ))
@@ -492,7 +561,7 @@ fn render_status(f: &mut ratatui::Frame<'_>, state: &State, cfg: &Config, area: 
 /// The idle help line.
 fn toolbar(state: &State) -> String {
     format!(
-        " {n} · Enter move/default · M-←/→ vol · M-m mute · ^V detail · Esc",
+        " {n} · Enter move/default · M-←/→ vol · M-m mute · M-p profile · ^V detail · Esc",
         n = state.results.len(),
     )
 }
@@ -683,6 +752,14 @@ fn render_detail(f: &mut ratatui::Frame<'_>, state: &State, cfg: &Config, area: 
                 feeding.join(", ")
             }),
         );
+        if let Some(p) = state
+            .audio
+            .device_of(n)
+            .and_then(|(_, d)| d.active_profile.and_then(|i| d.profiles.get(&i)))
+        {
+            l.push(Span::styled("   profile ", dim));
+            l.push(Span::raw(sanitize_display(&p.description)));
+        }
         l.push(Span::styled("   node ", dim));
         l.push(Span::raw(sanitize_display(&n.node_name)));
         l

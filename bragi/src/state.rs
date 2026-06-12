@@ -82,11 +82,33 @@ impl AudioNode {
     }
 }
 
+/// One profile a device offers (A2DP vs headset on bluez, HDMI vs analog on
+/// ALSA cards).
+#[derive(Debug, Clone)]
+pub struct Profile {
+    pub index: i32,
+    pub description: String,
+    pub available: bool,
+}
+
+/// A backing audio `Device` (ALSA card / bluez endpoint) — the thing profiles
+/// hang off. Nodes point here via [`AudioNode::device_id`].
+#[derive(Debug, Clone, Default)]
+pub struct AudioDevice {
+    pub name: String,
+    /// Profiles by index (BTreeMap so choosers render in a stable order).
+    pub profiles: BTreeMap<i32, Profile>,
+    /// Index of the active profile.
+    pub active_profile: Option<i32>,
+}
+
 /// Snapshot of everything bragi knows about the graph.
 #[derive(Debug, Clone, Default)]
 pub struct AudioState {
     /// Nodes by global id; BTreeMap so iteration is stable.
     pub nodes: BTreeMap<u32, AudioNode>,
+    /// Backing devices by global id.
+    pub devices: BTreeMap<u32, AudioDevice>,
     /// Links by global id → (output node id, input node id). Several per
     /// stream/sink pair (one per channel); we only care about the node pair.
     pub links: BTreeMap<u32, (u32, u32)>,
@@ -105,6 +127,12 @@ impl AudioState {
             _ => return false,
         };
         default == Some(node.node_name.as_str())
+    }
+
+    /// The backing device of a device node (where its profiles live).
+    pub fn device_of(&self, node: &AudioNode) -> Option<(u32, &AudioDevice)> {
+        let id = node.device_id?;
+        Some((id, self.devices.get(&id)?))
     }
 
     /// The device a stream is linked to (playback → sink, record → source).
