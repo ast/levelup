@@ -982,7 +982,6 @@ dependencies = [
  "mdns-sd",
  "nucleo-matcher",
  "ratatui",
- "rusqlite",
  "serde",
  "tokio",
  "toml 0.8.23",

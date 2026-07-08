@@ -13,7 +13,7 @@ A Rust workspace of personal-computing tools for a sway/wlroots Linux desktop, p
 - **mimir** — compact interactive status bar for sway (an i3status replacement). Single foreground process speaking the swaybar/i3bar JSON protocol; reads `/proc` & `/sys` via `nom`. No SQLite, no TUI picker.
 - **sleipnir** — modeless frecency navigator (`Ctrl-T`): one picker over directories *and* files you've touched (dirs from a chpwd hook, files mined from munin's history).
 - **valkyrie** — modeless, humane process finder/handler (`Alt-P`): fuzzy-find processes and signal them (SIGTERM / hold-to-SIGKILL / STOP-CONT / any signal). No daemon, no storage.
-- **heimdall** — rootless, presence-first LAN device finder: concurrent ARP-sweep + mDNS + SSDP, live picker, MAC-keyed SQLite *cache* (not history). Background tokio engine → sync ratatui TUI over a channel.
+- **heimdall** — rootless, presence-first LAN device finder: concurrent ARP-sweep + mDNS + SSDP, live picker. No persistent storage — a purely live, in-memory presence view (who's up *now*); relaunch rediscovers from scratch. Background tokio engine → sync ratatui TUI over a channel.
 
 **Shared library crates** (see "Shared crates" below):
 

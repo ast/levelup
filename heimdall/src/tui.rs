@@ -20,10 +20,8 @@ use ratatui::layout::{Constraint, Direction, Layout as LayoutWidget, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row as TableRow, Table, TableState};
-use rusqlite::Connection;
 
 use crate::actions;
-use crate::cache;
 use crate::config::{self, Config};
 use crate::device::{Device, Seen};
 use crate::discover::{self, engine, engine::Engine};
@@ -59,9 +57,6 @@ struct State {
     status: Option<(String, Instant)>,
     /// Detail strip visible? Toggled with Ctrl-V; seeded from `cfg.preview`.
     show_detail: bool,
-    /// MAC-keyed speed cache (None if it couldn't be opened).
-    cache: Option<Connection>,
-    last_flush: Instant,
 }
 
 /// What the run loop must do after a key (most actions handle themselves; ssh
@@ -78,10 +73,9 @@ const STATUS_LINGER: Duration = Duration::from_secs(4);
 pub fn run() -> Result<()> {
     let cfg = config::load_or_default();
     let cidrs = discover::local_cidrs().join(", ");
-    let cache = cache::open();
     let engine = engine::spawn();
     let mut term = terminal::setup()?;
-    let result = run_loop(&mut term, engine, cidrs, cache, &cfg);
+    let result = run_loop(&mut term, engine, cidrs, &cfg);
     terminal::restore(&mut term).ok();
     result
 }
@@ -90,11 +84,9 @@ fn run_loop(
     term: &mut Terminal<CrosstermBackend<File>>,
     engine: Engine,
     cidrs: String,
-    cache: Option<Connection>,
     cfg: &Config,
 ) -> Result<()> {
     let (ports_tx, ports_rx) = mpsc::channel();
-    let now = Instant::now();
     let mut state = State {
         query: String::new(),
         cursor: 0,
@@ -107,32 +99,7 @@ fn run_loop(
         ports_rx,
         status: None,
         show_detail: cfg.preview,
-        cache,
-        last_flush: now,
     };
-
-    // Seed from the cache so relaunch shows last-known devices instantly,
-    // dimmed (last-seen pushed back past the "quiet" threshold) until the live
-    // engine confirms — or the liveness timeout drops them.
-    if let Some(c) = &state.cache {
-        let seed = now
-            .checked_sub(Duration::from_secs(WARN_SECS + 5))
-            .unwrap_or(now);
-        for cd in cache::load(c) {
-            let mut device = Device::new(cd.ip);
-            device.mac = Some(cd.mac);
-            device.vendor = cd.vendor;
-            device.hostname = cd.hostname;
-            device.services = cd.services;
-            state.devices.insert(
-                cd.ip,
-                Entry {
-                    device,
-                    last_seen: seed,
-                },
-            );
-        }
-    }
 
     loop {
         // Drain everything the engine has discovered since last tick.
@@ -152,12 +119,6 @@ fn run_loop(
             .retain(|_, e| now.duration_since(e.last_seen) < DROP);
         state.refresh();
 
-        // Periodically persist what we know (so relaunch is instant).
-        if state.last_flush.elapsed() > Duration::from_secs(15) {
-            flush_cache(&state.cache, &state.devices);
-            state.last_flush = Instant::now();
-        }
-
         term.draw(|f| render(f, &mut state, cfg))?;
 
         if event::poll(TICK)?
@@ -166,10 +127,7 @@ fn run_loop(
         {
             match handle_key(key, &mut state) {
                 Step::Continue => {}
-                Step::Quit => {
-                    flush_cache(&state.cache, &state.devices);
-                    return Ok(());
-                }
+                Step::Quit => return Ok(()),
                 Step::Ssh(ip) => {
                     // ssh takes over the terminal: drop the alternate screen,
                     // run it in the foreground, then re-enter the picker.
@@ -653,17 +611,4 @@ fn render_detail(f: &mut ratatui::Frame<'_>, state: &State, cfg: &Config, area: 
     ]);
     f.render_widget(left, cols[0]);
     f.render_widget(right, cols[1]);
-}
-
-/// Upsert all currently-known devices (those with a MAC) into the cache.
-fn flush_cache(cache: &Option<Connection>, devices: &BTreeMap<Ipv4Addr, Entry>) {
-    let Some(c) = cache else {
-        return;
-    };
-    let now_unix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let devs: Vec<(&Device, i64)> = devices.values().map(|e| (&e.device, now_unix)).collect();
-    cache::save(c, &devs);
 }

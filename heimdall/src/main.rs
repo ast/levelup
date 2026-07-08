@@ -5,7 +5,6 @@
 //! Run `heimdall` for the live picker, `heimdall scan` for a one-shot dump.
 
 mod actions;
-mod cache;
 mod config;
 mod device;
 mod discover;
