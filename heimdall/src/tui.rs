@@ -469,18 +469,27 @@ fn render_list(f: &mut ratatui::Frame<'_>, state: &mut State, cfg: &Config, area
             let texts = [
                 d.ip.to_string(),
                 d.mac.clone().unwrap_or_else(|| "-".into()),
-                d.vendor.clone().unwrap_or_else(|| "?".into()),
+                d.vendor_label().into_owned(),
                 d.hostname.clone().unwrap_or_else(|| "-".into()),
                 d.services.join(", "),
             ];
             let cells: Vec<Cell> = texts
                 .iter()
-                .map(|t| {
+                .enumerate()
+                .map(|(i, t)| {
+                    // The VENDOR cell (index 2) is dimmed + italicised when it's
+                    // a synthesized note (`random`/`multicast`/`?`) rather than a
+                    // real OUI manufacturer, so it reads as metadata.
+                    let cell_base = if i == 2 && d.vendor.is_none() {
+                        base.add_modifier(Modifier::DIM | Modifier::ITALIC)
+                    } else {
+                        base
+                    };
                     Cell::from(highlight_cell(
                         t,
                         pattern.as_ref(),
                         &mut matcher,
-                        base,
+                        cell_base,
                         matched_style,
                     ))
                 })

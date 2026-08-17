@@ -8,6 +8,7 @@ mod actions;
 mod config;
 mod device;
 mod discover;
+mod mac;
 mod tui;
 
 use anyhow::Result;
@@ -84,7 +85,7 @@ fn run_scan() -> Result<()> {
             "{:<15} {:<17} {:<22} {:<22} {}",
             d.ip,
             d.mac.as_deref().unwrap_or("-"),
-            clip(d.vendor.as_deref().unwrap_or("?"), 22),
+            clip(d.vendor_label().as_ref(), 22),
             clip(d.hostname.as_deref().unwrap_or("-"), 22),
             d.services.join(","),
         );
