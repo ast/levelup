@@ -36,3 +36,10 @@ cobertura.xml
 
 # rust-analyzer (cargo projects don't need this file — ignore if generated)
 rust-project.json
+
+# Nix
+# direnv's per-project cache: symlinks into /nix/store plus a GC root, all
+# machine-local. `result` is the build symlink `nix build` drops here.
+.direnv/
+/result
+/result-*
